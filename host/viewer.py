@@ -8,6 +8,7 @@ import hashlib
 import os
 import queue
 import struct
+import sys
 import threading
 import time
 import uuid
@@ -59,7 +60,13 @@ class Gallery:
         line = f"{datetime.now():%H:%M:%S} {text.strip()}"
         with self.lock:
             self.logs.append(line)
-        print(line, flush=True)
+        # Redirected Windows output can use a legacy code page. Diagnostics must
+        # never turn a successful disk commit into MISS (and a duplicate retry).
+        try:
+            encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+            print(line.encode(encoding, errors="backslashreplace").decode(encoding), flush=True)
+        except (OSError, UnicodeError):
+            pass  # A closed/broken console does not affect the web log or delivery.
 
     def snapshot(self):
         with self.lock:
@@ -551,6 +558,5 @@ def main():
 
 if __name__ == "__main__":
     # replay imports SerialReader from this module; keep one shared Pillow lock.
-    import sys
     sys.modules.setdefault("viewer", sys.modules[__name__])
     main()

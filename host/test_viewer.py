@@ -69,6 +69,28 @@ class ViewerTests(unittest.TestCase):
             self.assertFalse(entry["preview"])
             self.assertEqual(gallery.paths[entry["id"]][0].read_bytes(), b"hello")
 
+    def test_legacy_console_encoding_does_not_fail_saved_file(self):
+        with tempfile.TemporaryDirectory() as tmp, io.BytesIO() as raw:
+            console = io.TextIOWrapper(raw, encoding="cp1252", errors="strict")
+            gallery = Gallery(Path(tmp), "TEST", 921600)
+            with patch("viewer.sys.stdout", console):
+                gallery.save(1, file_payload("照片.txt", b"hello"))
+            entry = gallery.files[0]
+            self.assertEqual(entry["name"], "照片.txt")
+            self.assertEqual(gallery.paths[entry["id"]][0].read_bytes(), b"hello")
+            self.assertTrue(any("照片.txt" in line for line in gallery.logs))
+            self.assertIn(b"\\u7167\\u7247.txt", raw.getvalue())
+            console.detach()
+
+    def test_broken_console_does_not_fail_saved_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gallery = Gallery(Path(tmp), "TEST", 921600)
+            with patch("viewer.sys.stdout", io.StringIO()) as console:
+                with patch.object(console, "write", side_effect=BrokenPipeError("closed console")):
+                    gallery.save(1, file_payload("photo.txt", b"hello"))
+            self.assertEqual(len(gallery.files), 1)
+            self.assertEqual(gallery.paths[gallery.files[0]["id"]][0].read_bytes(), b"hello")
+
     def test_http_preview_download_and_no_path_traversal(self):
         image = Image.new("RGB", (4, 4), "blue")
         output = io.BytesIO()
