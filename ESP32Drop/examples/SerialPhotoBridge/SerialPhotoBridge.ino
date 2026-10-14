@@ -1,4 +1,4 @@
-// UART0/CH340 photo bridge for a generic ESP32-S3 with 8 MB Octal PSRAM.
+// Native USB CDC photo bridge for XIAO ESP32S3 (8 MB Flash / 8 MB Octal PSRAM).
 #include <ESP32AWDL.h>
 #include <ESP32Drop.h>
 #include "bridge_app.h"

@@ -11,7 +11,11 @@
  */
 #include <stdio.h>
 #include <string.h>
+#ifdef _WIN32
+#define strncasecmp _strnicmp
+#else
 #include <strings.h>
+#endif
 #include <stdlib.h>
 #include "../ESP32Drop/src/airdrop/core/ad_http.h"
 #include "../ESP32Drop/src/airdrop/core/ad_serve.h"

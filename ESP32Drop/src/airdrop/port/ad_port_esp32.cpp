@@ -1,23 +1,3 @@
-/* ⚠️ THE RECEIVING HALF, AND IT IS ABSENT FROM A SENDER BUILD.
- *
- * Everything below compiles only when ESP32DROP_SENDER is NOT defined. The two roles cannot
- * share a device -- a listener task's 32,768-byte stack and a sender's lifelong TLS client
- * context do not both fit beside AWDL with anything left for an application -- so the build
- * decides which one exists instead of leaving a runtime flag to catch the mistake later.
- *
- * What a sender build stops carrying, measured: 5,662 bytes of static allocation
- * (g_adlog 1,616, ad_respond's frame 1,440, g_ssl 552, g_entropy 420, g_srvcert 408,
- * g_disc_body 320, g_ask_body 256, g_tlsconf 196, and the rest), plus every byte of the
- * receive path's code. More importantly it stops carrying ad_begin() itself: a send sketch
- * that called it by mistake would take a 32 KB task stack at runtime and only find out by
- * running short of memory somewhere else. Now it will not link, which is the earliest
- * possible place to be told.
- *
- * The symmetry is deliberate: ad_cycle.cpp and the bundled BLE advertiser are absent from a
- * RECEIVING build for exactly the same reason, in exactly the same way.
- */
-#if !defined(ESP32DROP_SENDER)
-
 /* ad_port_esp32.cpp -- the AirDrop application layer on the ESP32 backend.
  *
  * TLS termination, the HTTP/1.1 responder, the DvZip/cpio decode, and the handoff of a
@@ -42,8 +22,11 @@
 #include <stdlib.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <atomic>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "lwip/sockets.h"
 #include "esp_heap_caps.h"    /* heap_caps_malloc(..., MALLOC_CAP_SPIRAM): decode in PSRAM */
 
@@ -56,9 +39,7 @@
 #include "mbedtls/ssl_cache.h"
 #include "psa/crypto.h"
 
-/* The ONE include from src/awdl, and the rule permits exactly this one: the public
-   header. It brings awdl_ring.h, whose SPSC cursor the diagnostic ring below reuses
-   rather than growing a second, untested copy. */
+/* The AirDrop layer accesses AWDL only through its public header. */
 #include "../../ESP32AWDL.h"
 #include "ad_port_esp32.h"
 #include "../core/airdrop_cert.h"
@@ -84,7 +65,7 @@ static volatile uint32_t g_tcp_accept = 0;
 static volatile uint32_t g_tls_ok = 0;       // TLS handshake completed with a sender
 static volatile uint32_t g_discover_ok = 0;  // answered HTTP POST /Discover (=> tile)
 static volatile uint32_t g_ask_ok = 0;       // accepted a POST /Ask
-static volatile uint32_t g_upload_ok = 0;    // received & decoded a POST /Upload image
+static volatile uint32_t g_upload_ok = 0;    // complete archives accepted by file handlers
 static volatile uint32_t g_desync = 0;       // times the stream was out of frame
 
 // Millisecond-stamped event log for the application layer. The symptom being
@@ -529,13 +510,12 @@ static void ad_rx_tap(void *, const uint8_t src[6], const uint8_t *ip6, size_t i
  * 3. Dropping is correct when the ring is full, and is counted. Blocking a protocol task
  *    to wait for a UART is how a diagnostic becomes an outage.
  *
- * SPSC, one producer (the TLS task) and one consumer, using the same cursor and the same
- * barrier discipline as the frame ring -- awdl_ring.h, which has 19 host checks. That is
- * the ONE thing this file takes from the AWDL layer, through the public header, which is
- * exactly what the layering rule in tools/check-library.sh permits.
+ * TLS and ad_poll() both produce lines. A bounded static FreeRTOS queue supports
+ * both writers on separate cores. Sending with zero timeout drops diagnostics
+ * under overload instead of delaying the network.
  */
 /* -DAD_DIAG_DETAIL turns on the instruments that answer OPEN QUESTIONS rather than report
- * the device's state: the TLS session-cache probes, the listener's stack high-water sample,
+ * the device's state: the TLS session-cache probes
  * and the once-a-second listener-loop line. It is off by default because the ring below
  * holds eight slots and a per-second producer spends one of them every second -- the lines
  * a reader actually came for are the rare ones, and they are the ones a steady drip evicts.
@@ -547,29 +527,33 @@ static void ad_rx_tap(void *, const uint8_t src[6], const uint8_t *ip6, size_t i
 #define AD_DIAG_SLOTS 8
 #endif
 #define AD_DIAG_LINE  200
-struct AdDiagRing { struct AwdlRing cur; char slot[AD_DIAG_SLOTS][AD_DIAG_LINE]; };
-static struct AdDiagRing g_adlog;
+// TLS and ad_poll() both produce logs, potentially on different cores. A static
+// FreeRTOS queue serializes those producers without allocating or blocking them.
+static StaticQueue_t g_adlog_control;
+static uint8_t g_adlog_storage[AD_DIAG_SLOTS * AD_DIAG_LINE];
+static QueueHandle_t g_adlog = nullptr;
+static std::atomic<uint32_t> g_adlog_drops{0};
 
 static bool ad_diag_stage(const char *line, int n) {
-  if (!g_adlog.cur.mask) return false;        /* before ad_begin(): nowhere to put it */
+  if (!g_adlog) return false;
   if (n <= 0) return false;
   if (n > AD_DIAG_LINE - 1) n = AD_DIAG_LINE - 1;
-  int slot = awdl_ring_reserve(&g_adlog.cur);
-  if (slot < 0) return false;                 /* counted in g_adlog.cur.drops */
-  memcpy(g_adlog.slot[slot], line, (size_t)n);
-  g_adlog.slot[slot][n] = 0;
-  awdl_ring_commit(&g_adlog.cur);
+  char entry[AD_DIAG_LINE] = {};
+  memcpy(entry, line, (size_t)n);
+  if (xQueueSend(g_adlog, entry, 0) != pdTRUE) {
+    g_adlog_drops.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
   return true;
 }
 
 size_t ad_diag_read_line(char *dst, size_t cap) {
-  int slot = awdl_ring_peek(&g_adlog.cur);
-  if (slot < 0 || !cap) return 0;
-  size_t n = strlen(g_adlog.slot[slot]);
+  char entry[AD_DIAG_LINE];
+  if (!cap || !g_adlog || xQueueReceive(g_adlog, entry, 0) != pdTRUE) return 0;
+  size_t n = strlen(entry);
   if (n > cap - 1) n = cap - 1;
-  memcpy(dst, g_adlog.slot[slot], n);
+  memcpy(dst, entry, n);
   dst[n] = 0;
-  awdl_ring_release(&g_adlog.cur);
   return n;
 }
 
@@ -594,7 +578,7 @@ void ad_body_release(void) {
 }
 #endif
 
-uint32_t ad_diag_dropped(void) { return g_adlog.cur.drops; }
+uint32_t ad_diag_dropped(void) { return g_adlog_drops.load(std::memory_order_relaxed); }
 
 /* Formats into a local buffer and stages it. The trailing newline stays in the format
    string exactly as it was when these were Serial.printf, so the output is unchanged. */
@@ -613,7 +597,7 @@ static uint32_t g_ask_ms = 0;         // when we last answered /Ask (the /Upload
 
 // ---- received-image handoff (TLS task decodes -> main task draws) ------------
 // All SPI/display I/O must stay on the main task; the TLS task only decodes into
-// PSRAM and publishes the result. g_img_ready is set LAST as the release flag.
+// PSRAM and publishes the result. g_arch_ready is set LAST as the release flag.
 /* When the receive state last CHANGED. "Receiving" is a claim about now, and it used to be
  * set by the /Ask reply and cleared only by a completed upload -- so a sender that answered
  * /Ask and then never sent anything (observed: reconnected, finished TLS, then ten seconds
@@ -624,15 +608,60 @@ static uint32_t g_ask_ms = 0;         // when we last answered /Ask (the /Upload
 static volatile uint32_t g_rx_touch_ms = 0;
 static volatile bool     g_rx_active   = false;   // transfer in progress: "Receiving" UI
 static volatile uint32_t g_rx_bytes    = 0;       // compressed bytes received so far
+static std::atomic<bool> g_upload_running{false};
+static std::atomic<uint32_t> g_rx_started_ms{0}, g_rx_elapsed_ms{0};
+static std::atomic<uint32_t> g_decode_us{0}, g_decode_max_us{0};
+static std::atomic<int> g_listener_core{-1};
+static TaskHandle_t g_listener_task = nullptr;
 // A finished transfer is a cpio ARCHIVE, not an image. The TLS task publishes the whole
 // decoded block and does no parsing; ad_poll() walks it on the caller's task and hands over
 // every regular file it holds. Parsing on the consumer side is deliberate: the walk is
 // bounds-checked code fed by a remote sender (ad_cpio.h, 35 host checks under ASan), and
 // there is no reason to run it inside the task that is holding the TLS session open.
-static volatile bool     g_arch_ready  = false;   // an archive awaits delivery
+static std::atomic<bool> g_arch_ready{false};     // release/acquire ownership across cores
 static uint8_t          *g_arch_block  = nullptr; // PSRAM block, freed after delivery
 static const uint8_t    *g_arch_buf    = nullptr; // the cpio within the block
 static volatile uint32_t g_arch_len    = 0;
+static uint32_t g_arch_transfer_id = 0;
+static uint32_t g_arch_next_file = 0, g_retry_ms = 0, g_delivery_retries = 0;
+static bool g_retry_wait = false, g_arch_refused = false;
+static bool g_in_file_callback = false, g_defer_file = false;
+static SemaphoreHandle_t g_preview_mutex = nullptr;
+static const uint8_t *g_preview_buf = nullptr;
+static uint32_t g_preview_id = 0, g_preview_len = 0;
+static uint8_t g_preview_state = 0;
+
+bool ad_preview_enable(void) {
+  if (!g_preview_mutex) g_preview_mutex = xSemaphoreCreateMutex();
+  return g_preview_mutex != nullptr;
+}
+
+static void preview_publish(const uint8_t *data, uint32_t len, uint8_t state,
+                            bool new_transfer = false) {
+  if (!g_preview_mutex) return;
+  xSemaphoreTake(g_preview_mutex, portMAX_DELAY);
+  if (new_transfer && ++g_preview_id == 0) ++g_preview_id;
+  g_preview_buf = data; g_preview_len = len; g_preview_state = state;
+  xSemaphoreGive(g_preview_mutex);
+}
+
+void ad_preview_read(uint32_t id, uint32_t offset, uint8_t *dst,
+                     uint32_t capacity, struct AdPreview *out) {
+  memset(out, 0, sizeof(*out));
+  if (!g_preview_mutex) return;
+  xSemaphoreTake(g_preview_mutex, portMAX_DELAY);
+  out->transfer_id = g_preview_id;
+  out->offset = id == g_preview_id ? offset : 0;
+  out->state = g_preview_state; out->available = g_preview_len;
+  if (dst && g_preview_buf && out->offset < g_preview_len) {
+    uint32_t n = g_preview_len - out->offset;
+    if (n > capacity) n = capacity;
+    if (n > 8192) n = 8192;
+    memcpy(dst, g_preview_buf + out->offset, n);
+    out->length = n;
+  }
+  xSemaphoreGive(g_preview_mutex);
+}
 static volatile uint32_t g_files_ok    = 0;
 static volatile uint32_t g_img_err     = 0;       // undecodable/oversize transfers
 static char              g_img_errmsg[40] = {0};
@@ -985,10 +1014,15 @@ static bool rx_pump_emit(void *vp, const struct AdDvzipRec *rec, const uint8_t *
     }
     memcpy(p->out + p->out_len, payload, rec->len);
     p->out_len += rec->len; p->nrec++; p->nstored++;
+    preview_publish(p->out, p->out_len, 1);
     return true;
   }
+  const uint32_t decode_start = micros();
   size_t got = tinfl_decompress_mem_to_mem(p->out + p->out_len, room,
                                            payload, rec->len, TINFL_FLAG_PARSE_ZLIB_HEADER);
+  const uint32_t elapsed = (uint32_t)(micros() - decode_start);
+  g_decode_us.fetch_add(elapsed, std::memory_order_relaxed);
+  if (elapsed > g_decode_max_us.load()) g_decode_max_us = elapsed;
   if (got == TINFL_DECOMPRESS_MEM_TO_MEM_FAILED) {
     /* mem_to_mem reports one bit: failed. WHICH failure decides the HTTP status --
        out of room is this device's problem, a broken zlib stream is the sender's --
@@ -1001,6 +1035,7 @@ static bool rx_pump_emit(void *vp, const struct AdDvzipRec *rec, const uint8_t *
     return false;
   }
   p->out_len += (uint32_t)got; p->nrec++;
+  preview_publish(p->out, p->out_len, 1);
   return true;
 }
 
@@ -1144,10 +1179,20 @@ static bool rx_sink_grow(struct HttpSink *sk, uint32_t need) {
 // Sets g_upload_ok / g_img_* on success, g_img_err on failure.
 static void rx_upload(struct HttpRdr *r, bool chunked, int clen) {
   mbedtls_ssl_context *ssl = (mbedtls_ssl_context *)r->ctx;
+  if (g_arch_ready) {
+    const char busy[] = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    ssl_write_all(ssl, (const unsigned char *)busy, sizeof(busy) - 1);
+    return;
+  }
   g_rx_active = true; g_rx_bytes = 0;
   g_rx_touch_ms = (uint32_t)(esp_timer_get_time() / 1000);
+  g_rx_started_ms = g_rx_touch_ms; g_rx_elapsed_ms = 0;
+  g_decode_us = 0; g_decode_max_us = 0; g_upload_running = true;
+  bool handoff_pending = false;
   g_rx_grow_failed = false;
+  g_img_errmsg[0] = 0;
   uint32_t err0 = g_img_err;
+  preview_publish(nullptr, 0, 1, true);
 
   struct RxPump pump;
   memset(&pump, 0, sizeof(pump));
@@ -1166,6 +1211,7 @@ static void rx_upload(struct HttpRdr *r, bool chunked, int clen) {
   uint32_t body_total = 0;
   uint8_t *gz = (uint8_t *)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
   bool overflow = false, clean_end = false;
+  const char *receipt_error = nullptr;
   if (!gz) { strlcpy(g_img_errmsg, "out of PSRAM", sizeof(g_img_errmsg)); g_img_err++; goto done_norsp; }
 
   // The de-chunker, the DvZip completion probe and the poisoning rules all live in
@@ -1202,9 +1248,9 @@ static void rx_upload(struct HttpRdr *r, bool chunked, int clen) {
         AD_LOG("UPLOAD-STOP: rc=%d after %lu bytes\n", rc, (unsigned long)body_total);
         break;
     }
-    EV("upload_recv rc=%d total=%lu residue=%lu decoded=%lu poisoned=%d eof=%d",
+    EV("upload_recv rc=%d total=%lu residue=%lu decoded=%lu poisoned=%d eof=%d tmo=%d",
        rc, (unsigned long)body_total, (unsigned long)len,
-       (unsigned long)pump.out_len, r->poisoned, r->eof);
+       (unsigned long)pump.out_len, r->poisoned, r->eof, r->timed_out);
   } else if (clen > 0) {
     if ((uint32_t)clen > g_rx_max) overflow = true;
     else {
@@ -1232,6 +1278,15 @@ static void rx_upload(struct HttpRdr *r, bool chunked, int clen) {
     if (pump.fail == RXF_OOM || pump.psram_limited) g_rx_grow_failed = true;
   }
 
+  // A read timeout is not an HTTP/DvZip delimiter. Never acknowledge or publish
+  // a decodable prefix as a successful upload (442329-byte iPhone regression).
+  if (!clean_end) receipt_error = r->timed_out ? "upload receive timeout" : "upload body truncated";
+  else if (pump.mode == RXM_STREAM && !pump.fail) {
+    if (!ad_dvzip_end_ok(pump.end)) receipt_error = "dvzip truncated";
+    else if (!ad_cpio_has_complete_files(pump.out, pump.out_len))
+      receipt_error = "archive truncated or empty";
+  }
+
   {  /* TELL THE SENDER WHETHER WE ACTUALLY GOT IT.
       *
       * This used to answer 200 unconditionally, on the rule that "success is about
@@ -1256,6 +1311,8 @@ static void rx_upload(struct HttpRdr *r, bool chunked, int clen) {
     else if (overflow)                     status = g_rx_grow_failed ? "507 Insufficient Storage"
                                                                      : "413 Content Too Large";
     else if (body_total < 6)               status = "400 Bad Request";
+    else if (receipt_error)                status = r->timed_out && !clean_end
+                                                   ? "408 Request Timeout" : "400 Bad Request";
     char h[128];
     int hl = snprintf(h, sizeof(h),
                       "HTTP/1.1 %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", status);
@@ -1306,6 +1363,10 @@ static void rx_upload(struct HttpRdr *r, bool chunked, int clen) {
     g_img_err++; goto done;
   }
   if (body_total < 6) { strlcpy(g_img_errmsg, "empty body", sizeof(g_img_errmsg)); g_img_err++; goto done; }
+  if (receipt_error) {
+    strlcpy(g_img_errmsg, receipt_error, sizeof(g_img_errmsg));
+    g_img_err++; goto done;
+  }
 
   if (pump.mode != RXM_STREAM) {
     // dump the body head so the format is unambiguous next run (1f8b=gzip, 070707=odc
@@ -1351,7 +1412,7 @@ static void rx_upload(struct HttpRdr *r, bool chunked, int clen) {
       // allocated at the ceiling, and a shrinking realloc to the real size frees the
       // tail in place.
       heap_caps_free(gz); gz = nullptr;                      // the residue served its purpose
-      if (pump.out_len) {
+      if (pump.out_len && !g_preview_mutex) {
         uint8_t *shr = (uint8_t *)heap_caps_realloc(pump.out, pump.out_len, MALLOC_CAP_SPIRAM);
         if (shr) pump.out = shr;
       }
@@ -1412,6 +1473,7 @@ static void rx_upload(struct HttpRdr *r, bool chunked, int clen) {
         pump.end = dvend;
         heap_caps_free(gz); gz = nullptr;
         if (pump.fail) {
+          preview_publish(nullptr, 0, 3);
           heap_caps_free(pump.out); pump.out = nullptr;
           strlcpy(g_img_errmsg, pump.fail == RXF_INFLATE ? "dvzip inflate failed"
                               : pump.fail == RXF_OOM     ? "out of PSRAM"
@@ -1419,7 +1481,7 @@ static void rx_upload(struct HttpRdr *r, bool chunked, int clen) {
                   sizeof(g_img_errmsg));
           g_img_err++; goto done;
         }
-        if (pump.out_len) {
+        if (pump.out_len && !g_preview_mutex) {
           uint8_t *shr2 = (uint8_t *)heap_caps_realloc(pump.out, pump.out_len, MALLOC_CAP_SPIRAM);
           if (shr2) pump.out = shr2;
         }
@@ -1450,7 +1512,15 @@ static void rx_upload(struct HttpRdr *r, bool chunked, int clen) {
       for (int i = 0; i < hn; i++) sprintf(hx + i * 3, "%02x ", cpio[i]);
       AD_LOG("CPIO: %lu bytes head: %s\n", (unsigned long)cpio_len, hx);
     }
-    if (g_arch_ready) {
+    if (g_img_err != err0 || !ad_cpio_has_complete_files(cpio, cpio_len)) {
+      preview_publish(nullptr, 0, 3);
+      if (outbuf) heap_caps_free(outbuf); else if (gz) { heap_caps_free(gz); gz = nullptr; }
+      if (g_img_err == err0) {
+        g_img_err++;
+        strlcpy(g_img_errmsg, "archive truncated or empty", sizeof(g_img_errmsg));
+      }
+    } else if (g_arch_ready) {
+      preview_publish(nullptr, 0, 3);
       // A previous archive is still waiting to be handed over. Dropping the new one is
       // right -- the alternative is freeing a block the consumer may be inside.
       if (outbuf) heap_caps_free(outbuf); else if (gz) { heap_caps_free(gz); gz = nullptr; }
@@ -1460,20 +1530,32 @@ static void rx_upload(struct HttpRdr *r, bool chunked, int clen) {
       g_arch_block = outbuf ? outbuf : gz;
       gz = nullptr; outbuf = nullptr;                          // ownership transferred
       g_arch_buf = cpio; g_arch_len = cpio_len;
-      g_upload_ok++;
-      g_arch_ready = true;                                     // release flag: set LAST
-      AD_LOG("UPLOAD-OK! %lu bytes of cpio -> handler\n", (unsigned long)cpio_len);
+      g_arch_transfer_id = g_preview_mutex ? g_preview_id : 0;
+      g_arch_next_file = 0; g_retry_wait = false; g_arch_refused = false;
+      preview_publish(cpio, cpio_len, 2);
+      handoff_pending = true;  // publish ownership only after all TLS cleanup below
+      AD_LOG("UPLOAD-READY: %lu bytes of cpio -> handler\n", (unsigned long)cpio_len);
     }
   }
 
 done:
+  // Invalidate before any free, including failures during the final DvZip drain.
+  if (g_img_err != err0 || pump.out) preview_publish(nullptr, 0, 3);
   if (gz) heap_caps_free(gz);
   if (pump.out) heap_caps_free(pump.out);   // a decode block that never reached handoff
   if (g_img_err != err0) AD_LOG("UPLOAD-ERR: %s\n", g_img_errmsg);   // was silent before
   g_rx_active = false;
+  g_rx_elapsed_ms = millis() - g_rx_started_ms.load();
+  g_upload_running = false;
+  // The consumer may free the archive or change error counters immediately after
+  // this store. No producer cleanup/error decisions may follow the handoff.
+  if (handoff_pending) g_arch_ready.store(true, std::memory_order_release);
   return;
 done_norsp:
+  preview_publish(nullptr, 0, 3);
   g_rx_active = false;
+  g_rx_elapsed_ms = millis() - g_rx_started_ms.load();
+  g_upload_running = false;
 }
 
 // HTTP phase: runs AFTER the TLS handshake completes, on the committed connection
@@ -1567,42 +1649,20 @@ static int chdump_recv(void *ctx, unsigned char *buf, size_t len) {
 #endif  /* AIRDROP_CH_DUMP */
 
 #define MAXC 12
-/* THE LISTENER'S ACTUAL STACK NEED. SETTLED: 32,768 allocated, 17,348 used at the peak.
- *
- * The task is created with 32,768 bytes. It was raised there from 4,096 because the mbedTLS
- * handshake overflowed the smaller stack and crashed, which establishes 4,096 is too little. What is enough is the measurement above: a real
- * transfer peaks at 17,348 bytes used, so 32,768 carries roughly 15 KB of headroom. The
- * number is worth having because the reserve is expensive -- 32,768 CONTIGUOUS bytes of
- * internal RAM is the largest single allocation the library makes, out of the same heap
- * mbedTLS wants two ~16.6 KB blocks from, so a sketch that fails to start the listener is
- * short of contiguous internal heap rather than of stack.
- *
- * Because the answer is known, the SAMPLING is behind AD_DIAG_DETAIL. It was the first
- * statement of the select loop's for(;;), so it ran ~10 times a second for the life of the
- * device to re-derive a constant. With the define off nothing writes g_ls_stack_min and
- * ad_listen_stack_min_free() reports 0, which is exactly what it reports before the task
- * has run; re-open the question by rebuilding with -DAD_DIAG_DETAIL.
- *
- * It is the minimum over the task's life, not the instant value: a handshake's peak is what
- * matters and it is over in a second. uxTaskGetStackHighWaterMark returns BYTES on
- * ESP-IDF, not words, whatever the AWDL layer's function name suggests. */
-static volatile uint32_t g_ls_stack_min = 0xffffffffu;
-
+/* Keep the 32 KiB internal stack reserve for mbedTLS. Sample the lifetime
+ * high-water mark on demand; ESP-IDF returns bytes, not words. */
 uint32_t ad_listen_stack_min_free(void) {
-  return (g_ls_stack_min == 0xffffffffu) ? 0 : g_ls_stack_min;
+  return g_listener_task ? (uint32_t)uxTaskGetStackHighWaterMark(g_listener_task) : 0;
 }
 
 static void tcp_listen_task(void *) {
+  g_listener_core = xPortGetCoreID();
   airdrop_tls_init();
   int ls = -1;
   int conn[MAXC]; uint32_t born[MAXC];
   for (int i = 0; i < MAXC; i++) conn[i] = -1;
   int active = -1; uint32_t t_data = 0, t_hs0 = 0;
   for (;;) {
-#ifdef AD_DIAG_DETAIL
-    { uint32_t hw = (uint32_t)uxTaskGetStackHighWaterMark(nullptr);
-      if (hw < g_ls_stack_min) g_ls_stack_min = hw; }
-#endif
     if (!g_tls_ready) { vTaskDelay(pdMS_TO_TICKS(1000)); airdrop_tls_init(); continue; }
     if (ls < 0) {
       ls = socket(AF_INET6, SOCK_STREAM, 0);
@@ -1758,13 +1818,18 @@ static void        *g_file_ctx = nullptr;
 
 void ad_on_file(ad_file_cb_t cb, void *ctx) { g_file_cb = cb; g_file_ctx = ctx; }
 
+void ad_file_retry_later(void) {
+  if (g_in_file_callback) g_defer_file = true;
+}
+
 /* The consumer half. The TLS task published a whole cpio archive and did no parsing; this
  * walks it and hands over every regular file, on the CALLER's task.
  *
  * The producer ordering in rx_upload -- block, then buf/len, then g_arch_ready LAST -- is
  * the release flag this relies on, and it is unchanged.
  *
- * ONE CALLBACK PER FILE, and the type is never a filter. What this replaces returned the
+ * One callback per file unless explicitly deferred, and the type is never a filter.
+ * What this replaces returned the
  * first JPEG or PNG in the archive and threw the rest away: a PDF, a text file, a contact
  * card, or the second of two photos disappeared, and the transfer was reported as "no
  * displayable image" rather than as delivered. The archives in the capture corpus are all
@@ -1775,6 +1840,8 @@ void ad_on_file(ad_file_cb_t cb, void *ctx) { g_file_cb = cb; g_file_ctx = ctx; 
  * documented as callback-lifetime only. */
 void ad_poll(void) {
   if (!g_arch_ready) return;
+  if (g_retry_wait && (uint32_t)(millis() - g_retry_ms) < 1000) return;
+  g_retry_wait = false;
 
   const uint8_t *buf = g_arch_buf;
   uint32_t blen = g_arch_len;
@@ -1787,11 +1854,12 @@ void ad_poll(void) {
     while (ad_cpio_next(&it, &e)) if (ad_cpio_is_regular(e.mode)) total++; }
 
   uint32_t idx = 0;
-  bool any_refused = false;
   { struct AdCpioIter it; struct AdCpioEntry e;
     ad_cpio_begin(&it, buf, blen);
     while (ad_cpio_next(&it, &e)) {
       if (!ad_cpio_is_regular(e.mode)) continue;      /* the "." every transfer carries */
+      const uint32_t index = idx++;
+      if (index < g_arch_next_file) continue;  // never redeliver already accepted files
       /* The archive's name is not NUL-terminated in a way we should trust, so it is copied
          into a bounded buffer rather than handed over as a pointer into remote bytes. */
       char path[128], name[64];
@@ -1804,11 +1872,23 @@ void ad_poll(void) {
       struct AdFile f;
       f.data = e.data; f.len = e.len; f.name = name; f.path = path;
       f.type = ad_cpio_sniff(e.data, e.len);
-      f.index = idx++; f.count = total;
+      f.index = index; f.count = total;
+      f.transfer_id = g_arch_transfer_id;
+      f.archive_offset = (uint32_t)(e.data - buf);
 
+      g_defer_file = false; g_in_file_callback = true;
       bool ok = g_file_cb ? g_file_cb(g_file_ctx, &f) : false;
+      g_in_file_callback = false;
+      if (!ok && g_defer_file) {
+        g_retry_ms = millis(); g_retry_wait = true; ++g_delivery_retries;
+        strlcpy(g_img_errmsg, "file delivery pending", sizeof(g_img_errmsg));
+        AD_LOG("DELIVERY-PENDING: file %lu/%lu; retaining archive for retry\n",
+               (unsigned long)(index + 1), (unsigned long)total);
+        return;  // ownership stays here; producer rejects overlapping uploads
+      }
+      g_arch_next_file = idx;
       if (ok) g_files_ok++;
-      else { g_img_err++; any_refused = true; }
+      else { g_img_err++; g_arch_refused = true; }
     }
     if (it.truncated) {
       g_img_err++;
@@ -1818,13 +1898,19 @@ void ad_poll(void) {
     } else if (total == 0) {
       g_img_err++;
       strlcpy(g_img_errmsg, "archive held no files", sizeof(g_img_errmsg));
-    } else if (any_refused) {
+    } else if (g_arch_refused) {
       strlcpy(g_img_errmsg, "handler refused a file", sizeof(g_img_errmsg));
+    } else {
+      g_upload_ok++;
+      if (strcmp(g_img_errmsg, "file delivery pending") == 0) g_img_errmsg[0] = 0;
+      AD_LOG("UPLOAD-OK: %lu files accepted by handler\n", (unsigned long)total);
     } }
 
+  preview_publish(nullptr, 0, 0);
   if (g_arch_block) { heap_caps_free(g_arch_block); g_arch_block = nullptr; }
   g_arch_buf = nullptr; g_arch_len = 0;
-  g_arch_ready = false; g_rx_active = false;
+  g_rx_active = false;
+  g_arch_ready.store(false, std::memory_order_release); // producer may start a new upload now
 }
 
 /* --- lifecycle ------------------------------------------------------------ */
@@ -1833,10 +1919,6 @@ static bool g_ad_role_receiver = false;
 bool ad_role_is_receiver(void) { return g_ad_role_receiver; }
 
 int ad_begin(const char *name, uint32_t max_receive) {
-  /* The roles are exclusive: a receiver holds a 32 KB listener stack and a sender holds a
-     TLS client context for its whole life, and neither leaves room for the other beside
-     AWDL. Recording which one claimed the device lets the second attempt be refused
-     instead of half-working in a way nothing reports. */
   g_ad_role_receiver = true;
 
   /* 0 means the library's own default, RX_MAX_AUTO (6 MiB); PSRAM can only lower what is
@@ -1845,7 +1927,8 @@ int ad_begin(const char *name, uint32_t max_receive) {
      hide the setting. What PSRAM cannot supply is reported through AdStatus.rx_max, not
      silently substituted. */
   g_rx_max = max_receive ? max_receive : RX_MAX_AUTO;
-  awdl_ring_init(&g_adlog.cur, AD_DIAG_SLOTS);   /* before the task that fills it */
+  g_adlog = xQueueCreateStatic(AD_DIAG_SLOTS, AD_DIAG_LINE,
+                               g_adlog_storage, &g_adlog_control);
 
   /* The name is what a sender sees. Refusing a bad one here, before anything is
      advertised, beats advertising something the user did not ask for: a name that cannot
@@ -1861,9 +1944,14 @@ int ad_begin(const char *name, uint32_t max_receive) {
   /* No announce callback is registered -- there is no periodic multicast announcement, for
      the reasons set out in the note above ad_respond(). The hook itself stays available. */
   /* 32 KB: mbedTLS handshake state is on this stack, and CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC
-   * means it cannot be moved to PSRAM. Priority 2 round-robins with the AWDL cadence. */
+   * means it cannot be moved to PSRAM. Keep below Wi-Fi/lwIP priorities. The S3
+   * bridge selects core 0 so inflate/TLS no longer shares core 1's AWDL cadence.
+   * Other sketches retain their original placement unless they opt in. */
+#ifndef AD_RECEIVE_CORE
+#define AD_RECEIVE_CORE 1
+#endif
   return xTaskCreatePinnedToCore(tcp_listen_task, "tcp_listen", 32768, nullptr, 2,
-                                 nullptr, 1) == pdPASS ? 0 : -1;
+                                 &g_listener_task, AD_RECEIVE_CORE) == pdPASS ? 0 : -1;
 }
 
 /* --- telemetry ------------------------------------------------------------ */
@@ -1880,6 +1968,13 @@ void ad_stats_read(struct AdStatus *out) {
   { uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
     out->rx_active = g_rx_active && (uint32_t)(now_ms - g_rx_touch_ms) <= AD_RX_STALL_MS; }
   out->rx_bytes    = g_rx_bytes;
+  out->delivery_pending = g_arch_ready.load();
+  out->delivery_retries = g_delivery_retries;
+  out->rx_elapsed_ms = g_upload_running.load()
+      ? millis() - g_rx_started_ms.load() : g_rx_elapsed_ms.load();
+  out->decode_us = g_decode_us.load();
+  out->decode_max_us = g_decode_max_us.load();
+  out->listener_core = g_listener_core.load();
   out->rx_max      = g_rx_max_eff;
   out->files_ok    = g_files_ok;
   out->file_err    = g_img_err;
@@ -1899,14 +1994,3 @@ void ad_stats_read(struct AdStatus *out) {
   out->syn_other   = g_syn_other;
   out->syn_other_port = g_syn_other_port;
 }
-
-#else  /* ESP32DROP_SENDER */
-
-/* A sender build. The receiving implementation is not here -- see the note at the top of
-   this file. Nothing is stubbed out: ad_begin(), ad_poll() and the rest simply do not
-   exist, so calling one is a link error rather than a silent waste of 32 KB.
-   ad_role_is_receiver() is the single exception, because ad_sender_begin() asks it. */
-#include "ad_port_esp32.h"
-bool ad_role_is_receiver(void) { return false; }
-
-#endif /* !ESP32DROP_SENDER */

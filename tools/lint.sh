@@ -9,9 +9,8 @@
 # cover this class: it lives in the sketch and in the port .cpp files, which they do not
 # compile. Only -Wshadow saw it.
 #
-# The examples between them compile BOTH builds of the library: PrintReceivedFiles and
-# ShowReceivedImage the receiver, GreetingCard (ESP32DROP_SENDER in its build_opt.h) the
-# sender. A warning in either half is caught here.
+# The examples compile the receive library: PrintReceivedFiles, ShowReceivedImage and
+# SerialPhotoBridge. A warning in that build is caught here.
 #
 # Two categories are deliberately NOT fatal, and it matters that this is a decision rather
 # than an oversight:
@@ -38,7 +37,7 @@ for d in ESP32Drop/examples/*/; do
   rm -rf "$ESP32DROP_ROOT/.build-lint/$name"
   printf '%-24s ' "$name"
   "$ACLI" --config-file "$CLI_CONFIG" compile \
-    --fqbn "$FQBN" "${ACLI_LIB[@]}" --warnings all \
+    --fqbn "$(example_fqbn "$name")" "${ACLI_LIB[@]}" --warnings all \
     --build-property "compiler.c.elf.extra_flags=$ELF_EXTRA_FLAGS" \
     --build-property "compiler.cpp.extra_flags=-Wshadow" \
     --build-path "$ESP32DROP_ROOT/.build-lint/$name" \
@@ -53,7 +52,7 @@ for d in ESP32Drop/examples/*/; do
     || { echo "FAIL: no warning from ESP32Drop/src -- the gate does not reach the library"; exit 2; }
 
   # Only our own files: the core's warnings are not ours to fix and would drown these.
-  HITS=$(grep -E "^$ESP32DROP_ROOT/ESP32Drop/(examples/$name/[A-Za-z0-9_]+\.(ino|h)|src/.*\.(h|cpp)):[0-9]+:[0-9]+: warning:" "$LOG" \
+  HITS=$(grep -E "^$ESP32DROP_ROOT/ESP32Drop/(examples/$name/[A-Za-z0-9_]+\.(ino|h|cpp)|src/.*\.(h|cpp)):[0-9]+:[0-9]+: warning:" "$LOG" \
          | grep -E "$FATAL_RE" || true)
   if [[ -n "$HITS" ]]; then
     echo "FAIL"; echo "$HITS"; rc=1

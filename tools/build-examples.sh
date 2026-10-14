@@ -13,7 +13,7 @@ for d in ESP32Drop/examples/*/; do
   name=$(basename "$d")
   printf '%-24s ' "$name"
   if out=$("$ACLI" --config-file "$CLI_CONFIG" compile \
-        --fqbn "$FQBN" "${ACLI_LIB[@]}" --warnings none \
+        --fqbn "$(example_fqbn "$name")" "${ACLI_LIB[@]}" --warnings none \
         --build-property "compiler.c.elf.extra_flags=$ELF_EXTRA_FLAGS" \
         --build-path "$ESP32DROP_ROOT/.build-example" "$d" 2>&1); then
     echo "OK   $(echo "$out" | grep -oE '[0-9]+ bytes \([0-9]+%\) of program storage' | head -1)"

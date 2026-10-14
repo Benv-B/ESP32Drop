@@ -1,9 +1,7 @@
-/* ad_peertab.h -- who is nearby, how close, and can they receive.
+/* ad_peertab.h -- who is nearby, how close, and whether they offer AirDrop.
  *
- * The send path needs three things about a neighbour and nothing else: its MAC (to connect
- * to), how strong its frames are (to decide it is close enough to mean it), and whether it
- * has been heard offering _airdrop._tcp (to know a transfer can even be attempted). This
- * holds exactly that.
+ * A row holds a neighbour's MAC, how strong its frames are, and whether it has been heard
+ * offering _airdrop._tcp. This holds exactly that.
  *
  * WHY NOT awdl_census.h. The census remembers up to six names and service types per peer
  * and measures 3,604 bytes. It exists to answer "what is on
@@ -17,7 +15,7 @@
  * UUIDs, TXT fragments, CLink-<hex> -- and the census-era capture rate for a real name was
  * 0 of 2 peers, so the field would have been empty in almost every row that had one. The
  * name a user should see comes from /Discover's ReceiverComputerName instead, which IS
- * measured to arrive, and which the send path already has to read. Dropping it takes a row
+ * measured to arrive on /Discover. Dropping it takes a row
  * from 60 bytes to 20 and the table from 484 to 164.
  *
  * DEPENDENCY-FREE, like every other header in core/ here: no Arduino, no ESP-IDF, no allocation.
@@ -30,7 +28,7 @@
  * for its PRODUCER and the type for its CONSUMER. check-library.sh's rule 3 matches include
  * targets against /airdrop|ad_/, so a file called ad_peertab.h inside awdl/ trips a rule it
  * does not actually break -- and a checker that has to be argued with stops being read. The
- * names adp_ and AdPeerTab stay: they are the published surface ad_send.h uses.
+ * names adp_ and AdPeerTab stay: renaming them would not change what the table records.
  * (And note the literal that broke this comment on the way in -- "adp_*" followed by a
  *  slash closes a block comment. Two errors, neither of them where the text was.)
  *
@@ -95,8 +93,8 @@ static inline int adp_find(const struct AdPeerTab *t, const uint8_t mac[6]) {
  * is stronger than the -14 dBm measured with a phone touching the badge. adp_frame() knew
  * this and seeded the real reading on a new row ("0 dBm would read as touching"), but
  * adp_service() creates rows too and did not, so a peer known only by its service record
- * arrived claiming the strongest signal a caller could see. GreetingCard picks the strongest
- * fresh row, so that row wins.
+ * arrived claiming the strongest signal a caller could see. A proximity comparison takes the
+ * strongest fresh row, so that row wins.
  *
  * Fixed where the row is HANDED OUT rather than in each writer, because there are two
  * writers today and the next one would have to remember. -128 is the weakest value an

@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # Build and flash one of the library's examples.
 #
-#   ./tools/flash-example.sh GreetingCard
+#   ./tools/flash-example.sh PrintReceivedFiles
 #
 # The examples are what a user actually runs, and an example nobody flashes is an example
-# nobody has seen work -- GreetingCard once compiled and linked in a configuration that
-# could not wake a peer. Each example gets its own build dir.
+# nobody has seen work. Each example gets its own build dir.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 cd "$ESP32DROP_ROOT"
 NAME="${1:-}"
 [[ -z "$NAME" ]] && { echo "usage: $0 <ExampleName>"; ls ESP32Drop/examples; exit 2; }
 SKETCH="$ESP32DROP_ROOT/ESP32Drop/examples/$NAME"
+FQBN="$(example_fqbn "$NAME")"
 [[ -d "$SKETCH" ]] || { echo "no such example: $NAME"; ls ESP32Drop/examples; exit 2; }
 BUILD="$ESP32DROP_ROOT/.build-ex-$NAME"
 

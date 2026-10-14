@@ -64,6 +64,24 @@ class ProtocolTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 unpack_file(payload)
 
+    def test_short_write_preserves_next_frame_inside_claimed_body(self):
+        broken = encode_frame(FILE, 1, file_payload("x", b"a" * 60))[:HEADER.size + 8]
+        next_frame = encode_frame(FILE, 2, file_payload("good.jpg", b"b" * 100))
+        decoder = FrameDecoder()
+        frames = decoder.feed(broken + next_frame)
+        self.assertEqual([f.sequence for f in frames], [2])
+        self.assertEqual(unpack_file(frames[0].payload)[1], b"b" * 100)
+
+    def test_status_trickle_cannot_keep_truncated_frame_alive(self):
+        packet = encode_frame(FILE, 1, file_payload("lost", b"a" * 100000))
+        decoder = FrameDecoder()
+        self.assertEqual(decoder.feed(packet[:100], now=0), [])
+        for second in range(2, 30, 2):
+            self.assertEqual(decoder.feed(encode_frame(LOG, second, b"status"), now=second), [])
+        frames = decoder.feed(encode_frame(LOG, 30, b"recovered"), now=30)
+        self.assertEqual([f.sequence for f in frames], [30])
+        self.assertTrue(any("exceeded 30 s" in error for error in decoder.errors))
+
     def test_magic_inside_valid_payload(self):
         payload = file_payload("x", MAGIC * 10)
         frames = FrameDecoder().feed(encode_frame(FILE, 1, payload))

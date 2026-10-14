@@ -150,6 +150,15 @@ static bool ad_cpio_next(struct AdCpioIter *it, struct AdCpioEntry *out) {
   return true;
 }
 
+/* Validate before publishing: a complete prefix of a cut archive is not a transfer. */
+static bool ad_cpio_has_complete_files(const uint8_t *buf, uint32_t len) {
+  struct AdCpioIter it; struct AdCpioEntry e;
+  uint32_t files = 0;
+  ad_cpio_begin(&it, buf, len);
+  while (ad_cpio_next(&it, &e)) if (ad_cpio_is_regular(e.mode)) ++files;
+  return !it.truncated && files > 0;
+}
+
 /* "./dir/photo.png" -> "photo.png". Returns a pointer INTO name; nothing is copied. */
 static const char *ad_cpio_basename(const char *name, uint32_t name_len, uint32_t *out_len) {
   uint32_t start = 0;

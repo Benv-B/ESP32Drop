@@ -6,11 +6,40 @@ import unittest
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import serial
 
 from PIL import Image
 
 from protocol import file_payload
-from viewer import Gallery, SerialReader, handler_factory
+from viewer import Gallery, SerialReader, detect_usb_port, handler_factory
+
+
+class UsbPortTests(unittest.TestCase):
+    @staticmethod
+    def port(device, serial_number="xiao", vid=0x303A, pid=0x1001):
+        return SimpleNamespace(device=device, serial_number=serial_number, vid=vid, pid=pid)
+
+    @patch("viewer.list_ports.comports")
+    def test_detect_native_usb_not_uart(self, ports):
+        ports.return_value = [self.port("COM1", vid=None, pid=None), self.port("COM7")]
+        self.assertEqual(detect_usb_port().device, "COM7")
+
+    @patch("viewer.list_ports.comports")
+    def test_missing_or_ambiguous_requires_explicit_port(self, ports):
+        for candidates in ([], [self.port("COM7"), self.port("COM8", "other")]):
+            ports.return_value = candidates
+            with self.assertRaises(serial.SerialException):
+                detect_usb_port()
+
+    @patch("viewer.list_ports.comports")
+    def test_reenumeration_keeps_device_identity(self, ports):
+        ports.return_value = [self.port("COM9"), self.port("COM7", "other")]
+        self.assertEqual(detect_usb_port("xiao").device, "COM9")
+        with self.assertRaises(serial.SerialException):
+            detect_usb_port("missing")
 
 
 class ViewerTests(unittest.TestCase):

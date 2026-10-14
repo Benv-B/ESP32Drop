@@ -1,5 +1,5 @@
 param(
-    [string]$Port = "COM3",
+    [string]$Port = "auto",
     [int]$Baud = 921600,
     [int]$HttpPort = 8765,
     [switch]$NoBrowser

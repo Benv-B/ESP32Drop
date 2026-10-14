@@ -322,7 +322,7 @@ size_t awdl_diag_read_line(char *dst, size_t cap) {
 
 static uint8_t g_awdl_mac[6] = {0};
 static struct AwdlPeerTable g_peers;
-/* WHO IS NEARBY, for the send path. 484 bytes.
+/* WHO IS NEARBY. 484 bytes.
  *
  * WHY IT LIVES IN THE AWDL PORT and not with the AirDrop code that reads it: RSSI exists
  * for exactly one instant, in the promiscuous callback's rx_ctrl, and the transmitter MAC
@@ -1091,17 +1091,16 @@ static void process_frame(const RawFrame *f) {
     const uint8_t *src = h.src;
     /* Every AWDL ACTION frame from SOMEBODY ELSE moves that peer's RSSI. It is a table
        lookup (a memcmp over at most eight six-byte rows) plus a handful of stores, taken in
-       its own short section rather than folded into a longer one -- this is the send path's
-       input, not a diagnostic, so it is not something a build can switch off, and that
+       its own short section rather than folded into a longer one. The table is live peer
+       state, not a diagnostic, so it is not something a build can switch off, and that
        makes keeping it small the only lever there is.
     
        ⚠️ THE memcmp AGAINST OUR OWN MAC IS LOAD-BEARING, and it was missing. We receive our
        own transmissions -- the SVC dump below says so as measured fact, which is why it
        carries the same test -- so without it every MIF and PSF this device sends inserts a
        row for its own address, at self-reception signal strength. That row then wins any
-       proximity comparison: GreetingCard's pick() takes the strongest fresh row, so the
-       badge dialled its own link-local :8770, a sender build has no listener there, and the
-       result was ECONNREFUSED, a 30-second snub, and a retry -- for ever, because
+       proximity comparison, because the strongest fresh row is the one selected. The device
+       would pick its own link-local address and keep losing to itself, because
        esp_wifi_get_mac(WIFI_IF_AP) does not rotate the way a peer's AWDL address does. A
        real device in the room was displaced by the badge itself.
     

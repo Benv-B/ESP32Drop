@@ -72,7 +72,7 @@ int main(void) {
    * _airdrop._tcp, with no frame measured yet -- used to inherit an all-zero row, and zero
    * in rssi_avg is 0 dBm. That is stronger than the -14 dBm measured with a phone touching
    * the badge, so the peer nobody had heard from won every proximity comparison.
-   * GreetingCard picks the strongest fresh row, so it would have dialled that one. */
+   * A strongest-peer selection would then pick the stale row. */
   adp_reset(&t);
   { uint8_t svc[6] = {3,0,0,0,0,1};
     adp_service(&t, svc, 8770, 1000);

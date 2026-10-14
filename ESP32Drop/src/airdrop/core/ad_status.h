@@ -24,18 +24,24 @@ struct AdStatus {
   uint32_t tls_ok;          /* ...of which completed a TLS handshake                 */
   uint32_t discover_ok;     /* ...of which we answered POST /Discover (= the tile)   */
   uint32_t ask_ok;          /* ...of which we accepted POST /Ask                     */
-  uint32_t upload_ok;       /* ...of which delivered a file                          */
+  uint32_t upload_ok;       /* complete archives whose file handlers all accepted    */
   uint32_t desync;          /* streams abandoned because the framing was lost        */
 
   /* --- a transfer in flight ------------------------------------------------------- */
   bool     rx_active;
   uint32_t rx_bytes;        /* compressed bytes received so far                      */
+  uint32_t rx_elapsed_ms;   /* upload wall time, including waits/receipt handling     */
+  uint32_t decode_us;       /* elapsed time inside record inflate calls this upload */
+  uint32_t decode_max_us;   /* longest record inflate; includes preemption           */
+  int      listener_core;   /* observed CPU core, -1 before listener starts          */
   uint32_t rx_max;          /* the archive ceiling in force, in bytes. What ad_begin()
                                was asked for, or less when PSRAM could not supply it;
                                0 before the first transfer has sized it.             */
 
   /* --- files, and what went wrong ------------------------------------------------- */
   uint32_t files_ok;        /* files handed to the handler and accepted               */
+  bool     delivery_pending; /* validated archive still owned by the consumer        */
+  uint32_t delivery_retries; /* cumulative deferred delivery attempts                 */
   uint32_t file_err;        /* files the handler refused, plus archives we could not read */
   char     file_errmsg[40];
 

@@ -7,23 +7,23 @@
 
 ## 本仓库：AirDrop 串口照片桥接
 
-基于 [s-iwaki-d/ESP32Drop](https://github.com/s-iwaki-d/ESP32Drop) 的定制版本，保留上游代码和许可证。
-新增 `SerialPhotoBridge` 固件示例与 Windows 本机照片查看器，实现：
+基于 [s-iwaki-d/ESP32Drop](https://github.com/s-iwaki-d/ESP32Drop) 的定制版本，保留上游接收实现和许可证。
+发送路径已从本仓库删除。新增 `SerialPhotoBridge` 固件示例与 Windows 本机照片查看器，实现：
 
-**iPhone AirDrop → ESP32-S3（8 MB PSRAM）→ UART/CH340 → 电脑保存原图并显示预览。**
+**iPhone AirDrop → Seeed XIAO ESP32S3（8 MB Flash / 8 MB PSRAM）→ 原生 USB CDC → 电脑保存原图并显示预览。**
 
 接线、编译、烧录、启动查看器和测试说明见 **[中文使用说明](host/README.md)**。
-已实机完成单张 iPhone 照片接收及串口 CRC 校验；连续传输稳定性与速度仍需优化。
+当前 `xiao-dual-2` 将接收/解包与 USB 分配到两个核心，支持 JPEG / PNG 分段预览。USB 失败后保留 PSRAM 中的归档并重试，电脑校验并写盘后再确认交付；页面分别显示无线接收、USB 转发和保存阶段。
+真实 iPhone 接收链路曾实测通过；本版已完成实板 USB 分段预览、写盘故障补传和确认丢失测试，更新后的 iPhone 连续投送表现仍需实测。Spectra 6 的 SPI 驱动和实际屏幕刷新尚未实现。
 照片、原设备固件备份、日志和本地构建环境不纳入版本控制。
 
-以下为上游项目说明。
+以下说明已按本仓库改过，只描述接收。
 
 **English** | [日本語](#日本語)
 
-A library and example sketches that do AirDrop on an ESP32-S3. Open the share sheet on a
-Mac or iPhone, pick the device, send a photo, and it appears on the screen. The device can
-also send files the other way, to a Mac or an iPhone. The two ends connect directly, so no
-pairing and no router are involved.
+A library and example sketches that receive AirDrop on an ESP32-S3. Open the share sheet on a
+Mac or iPhone, pick the device, send a photo, and it appears on the screen. The two ends
+connect directly, so no pairing and no router are involved. This tree receives only.
 
 This is an independent re-implementation of Apple Wireless Direct Link and the AirDrop
 protocol, written from observed traffic. **Not affiliated with, authorised by, or endorsed
@@ -50,8 +50,8 @@ void loop() { ad_poll(); delay(10); }
 ```
 
 `examples/PrintReceivedFiles` is that sketch, complete. `examples/ShowReceivedImage` puts
-the photo on the display. `examples/GreetingCard` goes the other way: it sends a greeting
-card image to a nearby device.
+the photo on the display. `examples/SerialPhotoBridge` forwards each received file to a
+computer over USB.
 
 ## Installing
 
@@ -62,14 +62,10 @@ Library Manager index.
 
 It was written and verified on an M5Stack StopWatch with the `m5stack:esp32` board core,
 version 3.3.8, and the board options `PSRAM=opi` and `PartitionScheme=huge_app`
-(`tools/common.sh` has the exact FQBN). Other ESP32-S3 boards and other core versions have
-not been tried. `ShowReceivedImage` and `GreetingCard` also need the M5Unified library;
-`PrintReceivedFiles` needs nothing else.
-
-A sending sketch defines `ESP32DROP_SENDER`, and the define has to be in a `build_opt.h`
-file beside the sketch, not in the `.ino`: a define in the sketch reaches the sketch alone,
-while `build_opt.h` is passed to every compilation, so the library sees it too.
-`examples/GreetingCard/build_opt.h` is that one line.
+(`tools/common.sh` has the exact FQBN). The USB bridge also runs on a XIAO ESP32-S3 with
+8 MB Flash and PSRAM; its build settings are in `tools/build-serial-bridge.ps1`.
+Other core versions have not been tried. `ShowReceivedImage` also needs the M5Unified library;
+`PrintReceivedFiles` and `SerialPhotoBridge` need nothing else.
 
 ## What you need
 
@@ -91,43 +87,16 @@ task.
 
 - Receive files
   - Listens as an AirDrop "Everyone" target, then receives and decodes the files.
-  - Several files in one transfer work; the callback fires once per file.
-- Send files
-  - Sends one file of any type to a device that is listening as an AirDrop "Everyone"
-    target. You pass a MIME type or an Apple UTI, or leave it out and JPEG, PNG, GIF,
-    HEIC, PDF and ZIP are read from the leading bytes. Anything that cannot be settled
-    is refused rather than guessed.
-  - PNG and JPEG have been sent and accepted: files under 128 KiB (the `GreetingCard`
-    example) to a Mac and to an iPhone, larger files to a Mac only. Every other type is
-    sent exactly as declared, and whether a given peer takes it is not something this
-    library knows.
+  - Several files in one transfer work; the callback fires once per file unless it
+    explicitly requests another attempt with `ad_file_retry_later()`.
 - Announce any device name
   - The name is UTF-8, so it can be anything. Emoji are verified working.
 
 **Cannot**
 
-- "Contacts Only", in either direction
+- "Contacts Only"
   - That needs Apple's own signed identity information, which cannot be implemented from
     openly available information.
-- Receive and send from the same build
-  - The two can coexist in source, but the ESP32 does not have the memory to have both
-    enabled at once.
-  - A receiving build and a sending build are separate, and each compiles in only the
-    modules it needs.
-  - Define `ESP32DROP_SENDER` in `build_opt.h` to get the sending build (see Installing).
-- Send quickly and dependably
-  - There can be a delay between the device starting a send and the file arriving. This is
-    a memory constraint too.
-  - Sending over AirDrop means first waking the receiving side's listener, and that takes
-    BLE rather than Wi-Fi.
-  - BLE only has to put out a very simple packet, an advertisement, but the ESP32's BLE
-    library costs about 26 KB of internal RAM just for that, which leaves nothing for the
-    rest of the work to run alongside.
-  - So the memory constraint makes the two radios take turns: BLE on with Wi-Fi fully
-    stopped to advertise, then BLE off and Wi-Fi back up again.
-  - Bringing Wi-Fi back also costs the time AWDL needs to resynchronise. Advertisements
-    therefore go out only at sparse intervals, and the Wi-Fi watch has gaps in it. Neither
-    is avoidable in principle.
 - Coexist with ordinary Wi-Fi
   - An iPhone or a Mac runs ordinary Wi-Fi and AWDL/AirDrop at the same time. This
     implementation has no such arbitration.
@@ -142,21 +111,6 @@ with HTTP 413, so the sender reports a failure instead of appearing to succeed. 
 3.9 MB photo arrives as a 3,860,992-byte archive and is decoded while it is still arriving,
 so the compressed body is never held alongside the decoded one. An 8 MB part has room for
 about 7.1 MB of decoded archive, so pass that figure yourself if you want more than 6 MiB.
-
-**Send ceiling.** One file per send: `TotalBytes` was measured equal to `FileSize` for one
-file and its value for several is unknown. PSRAM must hold the archive and its framing,
-about twice the file, for the length of the transfer; `ad_send()` takes both blocks before
-`/Discover` and returns `AD_SEND_E_TOO_BIG` if they will not fit, so nobody is shown a
-dialog for a file that cannot be built. Names are at most 120 bytes of UTF-8 and may not
-contain `/`.
-
-The body goes out as a run of 128 KiB-grain DvZip records, which is how a real macOS sender
-frames one. That grain is not cosmetic: a single record larger than it reaches the receiver
-whole and is then rejected at 100% with a connection reset and no reply, because the
-receiving DvZip adapter assumes the grain. Files below one grain were always a single record
-and always worked, which is why the fault only appeared once a photo was sent. Photos of
-270-314 KB complete to a Mac; larger sends, and multi-record sends to an iPhone, are
-untested.
 
 **Internal RAM is the scarce resource, not PSRAM.** mbedTLS here is built with
 `CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC` and cannot fall back to PSRAM, and a session wants two
@@ -181,9 +135,8 @@ char line[200];
 while (ad_diag_read_line(line, sizeof(line))) Serial.print(line);
 ```
 
-`ad_diag_read_line()` is the receiver's reader. In a sending build the lines are staged by
-the AWDL layer instead, so use `awdl_diag_read_line()`. Using the wrong one fails at link
-time.
+`ad_diag_read_line()` reads lines staged by the AirDrop listener. The link layer stages its
+own lines separately; read those with `awdl_diag_read_line()`.
 
 `ad_stats_read()` fills a struct with counters and states — how many transfers were
 accepted, whether one is arriving now, how many bytes so far, the ceiling in force, and the
@@ -216,14 +169,11 @@ their original structure and their original size.
 
 ```
 ESP32Drop/src/ESP32AWDL.h       the link layer's public header
-ESP32Drop/src/ESP32Drop.h       the AirDrop layer's public header, receiving and sending
+ESP32Drop/src/ESP32Drop.h       the AirDrop layer's public header
 ESP32Drop/src/awdl/core/        link-layer logic, dependency-free, host-tested
 ESP32Drop/src/awdl/port/        the ESP32 radio, netif and timing
-ESP32Drop/src/airdrop/core/     HTTP, DvZip, cpio, bplist, DNS-SD, UTI — host-tested
+ESP32Drop/src/airdrop/core/     HTTP, DvZip, cpio, bplist, DNS-SD — host-tested
 ESP32Drop/src/airdrop/port/     TLS termination and the ESP32 network path
-ESP32Drop/src/airdrop/ad_send.* the send path
-ESP32Drop/src/airdrop/ad_cycle.* the BLE and AWDL alternation a send needs
-ESP32Drop/src/ble/              a minimal BLE advertiser, controller only
 tools/                          build, lint, layering and host-test scripts
 ```
 
@@ -244,9 +194,9 @@ licence grants any rights in them, and none could.
 
 [English](#esp32drop) | **日本語**
 
-ESP32-S3でAirDropを実現するライブラリとサンプル実装です。MacやiPhoneから共有シートを開いてデバイスを選び、
-写真を送るだけで画面に表示されます。逆に、MacやiPhoneにデバイスの側からファイルを送りつけることもできます。
-端末同士が直接接続し、ペアリングやルータなどは一切必要ありません。
+ESP32-S3でAirDropを受信するライブラリとサンプル実装です。MacやiPhoneから共有シートを開いてデバイスを選び、
+写真を送るだけで画面に表示されます。端末同士が直接接続し、ペアリングやルータなどは一切必要ありません。
+このツリーが行うのは受信だけです。
 
 これはApple Wireless Direct LinkとAirDropプロトコルの、観測したトラフィックから書き起こした
 独立再実装です。**Apple Inc. とは無関係で、許諾も承認も受けていません。** AirDropはApple Inc.の商標ですが、
@@ -272,7 +222,7 @@ void loop() { ad_poll(); delay(10); }
 ```
 
 `examples/PrintReceivedFiles` がこのスケッチの完全版です。`examples/ShowReceivedImage` は
-受け取った写真をディスプレイに表示します。`examples/GreetingCard` は逆方向 ── 近接端末にグリーティングカード画像を送信します。
+受け取った写真をディスプレイに表示します。`examples/SerialPhotoBridge` は受信したファイルを USB でパソコンへ転送します。
 
 ## インストール
 
@@ -282,12 +232,8 @@ void loop() { ad_poll(); delay(10); }
 
 実装と検証は M5Stack StopWatch、ボードコア `m5stack:esp32` 3.3.8、ボードオプション `PSRAM=opi` と
 `PartitionScheme=huge_app` で行いました（正確な FQBN は `tools/common.sh` にあります）。他の ESP32-S3 ボードや
-他のコアバージョンは試していません。`ShowReceivedImage` と `GreetingCard` は M5Unified も必要です。
-`PrintReceivedFiles` は他に何も要りません。
-
-送信用スケッチでは `ESP32DROP_SENDER` を定義しますが、これは `.ino` ではなくスケッチの隣の `build_opt.h` に
-書く必要があります。`.ino` 内の `#define` はスケッチにしか届かず、`build_opt.h` はすべてのコンパイルに渡されるので
-ライブラリにも届きます。`examples/GreetingCard/build_opt.h` がその 1 行です。
+他のコアバージョンは試していません。`ShowReceivedImage` は M5Unified も必要です。
+`PrintReceivedFiles` と `SerialPhotoBridge` は他に何も要りません。
 
 ## 必要なもの
 
@@ -307,30 +253,12 @@ void loop() { ad_poll(); delay(10); }
 - ファイル受信
   - AirDropのeveryone（すべての人）設定での待ち受けを行い、ファイルを受信・デコードすることが可能です。
   - 複数のファイル転送も可能です。コールバックがファイルごとに発火します。
-- ファイル送信
-  - AirDropのeveryone（すべての人）設定での待ち受けをしている端末に対し、任意の形式のファイルを
-    1 つ送信することができます。形式は MIME タイプか Apple UTI を渡すか、省略すれば
-    JPEG / PNG / GIF / HEIC / PDF / ZIP は先頭バイトから判定します。判定できないものは
-    推測せず拒否します。
-  - 実機で確認できているのは PNG と JPEG で、128 KiB 未満のファイル（`GreetingCard` example）は
-    Mac 宛・iPhone 宛とも、それより大きいファイルは Mac 宛のみです。それ以外の形式は宣言どおりに
-    送りますが、相手が受け入れるかどうかはライブラリには分かりません。
 - 自由な端末名を名乗らせる
   - UTF-8で自由な端末名を名乗らせることができます。絵文字も動作確認済
 
 **できないこと**
-- 「連絡先のみ」の送受信
-  - 「連絡先のみ」の送受信を実現するためには、Apple独自の署名情報が必要で、オープンな情報からでは実装することができません。
-- ファイル受信とファイル送信の同時利用
-  - コード上は共存可能ですが、同時に有効にするにはESP32のメモリが足りません。
-  - 受信用のビルドと、送信用のビルドは変える必要があります。それぞれ最小限のモジュールのみ組み込むようになっています。
-  - 送信用のビルドを作るときには `build_opt.h` で `ESP32DROP_SENDER` を定義してください（「インストール」参照）。
-- 安定した、素早い送信
-  - デバイス側AirDrop送信開始から着信までに時間がかかることがあります。これもメモリ不足からの制約となります。
-  - AirDropでファイルを送信するためには、先だって受信側の受信体制を起動させる必要があります。そして、そのためにはWiFiではなくBLEを使用します。
-  - BLEではごく簡単なパケット（アドバタイズパケット）を送信するだけなのですが、ESP32でのBLEライブラリを使用すると、それだけでも内蔵RAMを26KBほど使用してしまい、他の処理が併存できないことがわかっています。
-  - そのため、本実装ではBLEアドバタイズのときはBLE有効・WiFiを完全に停止し、BLEを送信したあとBLEを無効・WiFiを起動する、と、メモリ制約のために排他で動作させています。
-  - WiFi起動後AWDLの同期にかかる時間もあるため、BLEのアドバタイズがどうしても疎な間隔になること、WiFiの監視時間に穴ができることが原理上避けられません。
+- 「連絡先のみ」
+  - 「連絡先のみ」での受信を実現するためには、Apple独自の署名情報が必要で、オープンな情報からでは実装することができません。
 - 通常WiFiとの共存
   - iPhone/Macでは通常のWiFiとAWDL/AirDropを共存させることができますが、本実装ではそういった制御はできません。
 
@@ -345,19 +273,6 @@ void loop() { ad_poll(); delay(10); }
 ので、圧縮された本体がデコード後のものと同時に保持されることはありません。8 MB 品なら
 デコード後 約 7.1 MB まで置けるので、6 MiB より大きくしたいときは自分でその値を渡して
 ください。
-
-**送信の上限。** 1 回の送信につき 1 ファイルです（`TotalBytes` が `FileSize` と一致するのは
-1 ファイルでの実測で、複数のときの値は不明）。転送中は PSRAM がアーカイブとその framing、
-つまりファイルの約 2 倍を保持します。`ad_send()` は `/Discover` の前にこの 2 ブロックを確保し、
-入らなければ `AD_SEND_E_TOO_BIG` を返します ── 作れないファイルのために相手にダイアログを
-出させないためです。ファイル名は UTF-8 で 120 バイトまで、`/` は使えません。
-
-本体は 128 KiB 粒度の DvZip レコードの連なりとして送出されます。これは実際の macOS 送信側と
-同じ形で、粒度は飾りではありません ── 粒度を超える単一レコードは受信側に丸ごと届いたうえで
-100% の時点で接続リセットされ、応答なく拒否されます。受信側の DvZip アダプタが粒度を前提に
-しているためです。1 粒度未満のファイルは常に単一レコードで、常に成功していました。だから
-写真を送るまでこの不具合は現れませんでした。270〜314 KB の写真は Mac 宛に完了します。
-それより大きい送信と、複数レコードになるサイズの iPhone 宛送信は未検証です。
 
 **希少な資源は PSRAM ではなく内部 RAM です。** ここでの mbedTLS は
 `CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC` でビルドされており PSRAM にフォールバックできません。
@@ -382,8 +297,8 @@ char line[200];
 while (ad_diag_read_line(line, sizeof(line))) Serial.print(line);
 ```
 
-`ad_diag_read_line()` は受信側のリーダです。送信ビルドでは AWDL 層がログ行をステージング
-するので、`awdl_diag_read_line()` を使ってください。取り違えるとリンクエラーになります。
+`ad_diag_read_line()` は AirDrop リスナーがステージングした行を読みます。リンク層は別の行を
+ステージングするので、そちらは `awdl_diag_read_line()` で読んでください。
 
 `ad_stats_read()` は、カウンタと状態を構造体に埋めます ── 受け入れた転送の数、いま到着中か
 どうか、これまでのバイト数、効いている上限、そして直近のエラーをテキストで。
@@ -415,14 +330,11 @@ companion-link の UUID ── は同じ長さのプレースホルダに置換�
 
 ```
 ESP32Drop/src/ESP32AWDL.h       リンク層の公開ヘッダ
-ESP32Drop/src/ESP32Drop.h       AirDrop 層の公開ヘッダ。受信・送信とも
+ESP32Drop/src/ESP32Drop.h       AirDrop 層の公開ヘッダ
 ESP32Drop/src/awdl/core/        リンク層のロジック。依存なし、ホストテスト済み
 ESP32Drop/src/awdl/port/        ESP32 の無線・netif・タイミング
-ESP32Drop/src/airdrop/core/     HTTP, DvZip, cpio, bplist, DNS-SD, UTI ── ホストテスト済み
+ESP32Drop/src/airdrop/core/     HTTP, DvZip, cpio, bplist, DNS-SD ── ホストテスト済み
 ESP32Drop/src/airdrop/port/     TLS 終端と ESP32 のネットワークパス
-ESP32Drop/src/airdrop/ad_send.* 送信パス
-ESP32Drop/src/airdrop/ad_cycle.* 送信に必要な BLE と AWDL の切り替え
-ESP32Drop/src/ble/              最小構成の BLE アドバタイザ（コントローラのみ）
 tools/                          ビルド・lint・レイヤリング・ホストテストのスクリプト
 ```
 

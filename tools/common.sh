@@ -37,6 +37,16 @@ YAML
 # ESP32-S3 board with PSRAM.
 FQBN="${FQBN:-m5stack:esp32:m5stack_stopwatch:PartitionScheme=huge_app,PSRAM=opi,DebugLevel=error,USBMode=default,CDCOnBoot=cdc,UploadMode=cdc}"
 
+# SerialPhotoBridge uses HWCDC APIs; the display examples may still use TinyUSB.
+example_fqbn() {
+  local target="$FQBN"
+  if [[ "$1" == "SerialPhotoBridge" ]]; then
+    target="${target/USBMode=default/USBMode=hwcdc}"
+    target="${target/UploadMode=cdc/UploadMode=default}"
+  fi
+  printf '%s\n' "$target"
+}
+
 # No linker flags are needed. Kept as an override point for experiments.
 ELF_EXTRA_FLAGS="${ELF_EXTRA_FLAGS-}"
 

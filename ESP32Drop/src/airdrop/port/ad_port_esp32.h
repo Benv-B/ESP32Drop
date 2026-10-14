@@ -21,7 +21,8 @@
    PSRAM block that ad_poll() releases once the whole archive has been handed over -- copy
    what you need, do not keep the pointer.
    
-   ONE CALLBACK PER FILE. A transfer is a cpio archive and may hold several; you get each
+   Each file is delivered once unless the callback explicitly requests a retry with
+   ad_file_retry_later(). A transfer is a cpio archive and may hold several; you get each
    one. The library does not choose between them, and in particular it does not filter by
    type -- `type` is sniffed from the leading bytes as a convenience, and AD_FILE_OTHER is
    delivered exactly like the rest. (The code this replaces returned the FIRST JPEG or PNG
@@ -35,7 +36,23 @@ struct AdFile {
   int            type;      /* AD_FILE_* -- from the bytes, never from the name        */
   uint32_t       index;     /* 0-based position among the files in THIS transfer       */
   uint32_t       count;     /* how many files this transfer carries                    */
+  uint32_t       transfer_id;    /* optional live archive identity, 0 if unavailable */
+  uint32_t       archive_offset; /* file data offset inside that archive */
 };
+
+/* Optional live decoded-archive tap. Enable BEFORE ad_begin(). The TLS task only
+ * publishes immutable prefixes; callers copy at most 8192 bytes per read. No user
+ * code or USB I/O runs on the TLS task, and no extra image-sized buffer is allocated.
+ * State: 0 unavailable, 1 receiving, 2 validated archive, 3 aborted. A new id resets
+ * the requested offset to zero. Partial bytes are provisional, never a saved file.
+ * Successful data stays readable until ad_poll() finishes the file callbacks. */
+struct AdPreview {
+  uint32_t transfer_id, offset, length, available;
+  uint8_t state;
+};
+bool ad_preview_enable(void);
+void ad_preview_read(uint32_t transfer_id, uint32_t offset, uint8_t *dst,
+                     uint32_t capacity, struct AdPreview *out);
 
 /* Return false if you could not use the file. That is counted and reported through
    AdStatus.file_err / file_errmsg, so a badge that receives a format it cannot draw says
@@ -43,6 +60,14 @@ struct AdFile {
 typedef bool (*ad_file_cb_t)(void *ctx, const struct AdFile *f);
 
 void ad_on_file(ad_file_cb_t cb, void *ctx);
+
+/* Inside a file callback ONLY: request another attempt, then return false.
+ * The archive stays in PSRAM until delivery succeeds; ad_poll retries after 1 s.
+ * Earlier accepted files are skipped. New uploads get 503 while it is retained.
+ * No callback pointer may be kept by the application; reconnect the consumer to
+ * resume. Power loss still loses PSRAM. A false return without this call is a
+ * permanent refusal, preserving the original callback contract. */
+void ad_file_retry_later(void);
 
 /* Starts the TLS listener. AWDL must already be up: this binds to the link-local address
  * the AWDL netif owns.
@@ -83,8 +108,7 @@ int  ad_begin(const char *name, uint32_t max_receive);
    the AWDL layer's own task and does not depend on this being called promptly. */
 void ad_poll(void);
 
-/* True once ad_begin() has claimed this device for receiving. The sender refuses to start
- * on a device that has, and vice versa: the two cannot share the memory. */
+/* True once ad_begin() has claimed this device for receiving. */
 bool ad_role_is_receiver(void);
 
 void ad_stats_read(struct AdStatus *out);
@@ -97,26 +121,23 @@ void ad_stats_read(struct AdStatus *out);
  * to find enough stack. Whether the reserve can be cut is then a measurement rather than an
  * argument.
  *
- * That measurement is taken only under -DAD_DIAG_DETAIL: sampling it costs a
- * uxTaskGetStackHighWaterMark() on every pass of a 100 ms loop, for ever, to re-derive a
- * figure that is already known. Without the define this returns 0, the same as it does
- * before the task has run. */
+ * Sampled on demand; call at a low rate, not for every received packet. */
 uint32_t ad_listen_stack_min_free(void);
 
 /* --- diagnostics ----------------------------------------------------------------
  *
- * The library never writes to Serial. It stages one line at a time into a small ring and
+ * The library never writes to Serial. It stages one line at a time into a static queue and
  * you decide where they go -- which is the only arrangement that works, because these
  * lines are produced on the TLS task and a user-supplied sink would run there too. There
  * is no setLogSink() for that reason.
  *
  * Copies ONE whole line (NUL-terminated, keeping its own trailing newline) into dst and
- * returns its length, or 0 when the ring is empty. Call it in a loop:
+ * returns its length, or 0 when the queue is empty. Call it in a loop:
  *
  *     char line[200];
  *     while (ad_diag_read_line(line, sizeof(line))) Serial.print(line);
  *
- * Lines are dropped rather than blocking a protocol task when the ring is full;
+ * Lines are dropped rather than blocking a protocol task when the queue is full;
  * ad_diag_dropped() is the count, and a non-zero value means you are draining too slowly,
  * not that anything is wrong on the air. */
 size_t   ad_diag_read_line(char *dst, size_t cap);

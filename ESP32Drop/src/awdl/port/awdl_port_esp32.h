@@ -185,8 +185,7 @@ struct AwdlSnapshot {
 void awdl_snapshot_read(struct AwdlSnapshot *out);
 
 /* Nearby AWDL peers, with RSSI and whether each has been heard offering _airdrop._tcp.
- * This is the send path's input: RSSI is what tells a sample that somebody has come close
- * enough to mean it. `ttl_ms` drops rows not heard from in that long -- pass something
+ * `ttl_ms` drops rows not heard from in that long -- pass something
  * under the ~100 s AWDL MAC rotation, or the table will offer a MAC that no longer
  * answers; 0 disables expiry. See ESP32Drop/src/awdl/core/awdl_peertab.h. */
 void awdl_peertab_read(struct AdPeerTab *out, uint32_t now_ms, uint32_t ttl_ms);

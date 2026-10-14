@@ -92,6 +92,18 @@ static int walk(struct Seen *out, int cap, bool *truncated) {
 int main(void) {
   struct Seen s[8]; bool tr; int n; char d[160];
 
+  N = 0; odc(".", AD_CPIO_S_IFDIR | 0755, NULL, 0);
+  check("directory only is not a received file", !ad_cpio_has_complete_files(BUF, N), NULL);
+  odc("./photo.jpg", AD_CPIO_S_IFREG | 0644, JPG, sizeof JPG);
+  const uint32_t file_end = N;
+  check("cut photo must not be published", !ad_cpio_has_complete_files(BUF, N - 1), NULL);
+  check("whole file without optional trailer is valid", ad_cpio_has_complete_files(BUF, N), NULL);
+  odc("./second.jpg", AD_CPIO_S_IFREG | 0644, JPG, sizeof JPG);
+  check("good first file cannot mask cut second file", !ad_cpio_has_complete_files(BUF, N - 1), NULL);
+  trailer_odc();
+  check("complete multiple-file archive is valid", ad_cpio_has_complete_files(BUF, N), NULL);
+  check("partial next header is not a complete archive", !ad_cpio_has_complete_files(BUF, file_end + 3), NULL);
+
   puts("ad_cpio.h -- archive iteration");
 
   /* 1. THE MEASURED SHAPE. Every real transfer in the corpus is exactly this. */

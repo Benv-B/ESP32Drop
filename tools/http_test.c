@@ -118,6 +118,30 @@ static void check(const char *name, bool ok, const char *detail) {
 int main(void) {
   printf("== awdl_http.h host tests ==\n");
 
+  /* Synthetic framing matching the iPhone failure's counts, not captured photo
+     data: four records drained, 53599 residue, then silence at a chunk boundary. */
+  {
+    static unsigned char body[600000], wire[600100];
+    int n = 0;
+    n += dvzip_record(body + n, 169);
+    n += dvzip_record(body + n, 129500);
+    n += dvzip_record(body + n, 129500);
+    n += dvzip_record(body + n, 129545);
+    dvzip_record(body + n, 131072);
+    int w = chunk_wrap(wire, body, 442329);
+    Script s; memset(&s, 0, sizeof s); script_add(&s, 0, wire, w);
+    struct HttpRdr r; http_rdr_init(&r, &s, script_read);
+    struct HttpSink sk; sink_init(&sk, 6u << 20); sk.progress = cons_progress;
+    g_cons_recs = 0; g_cons_pay = g_cons_total = g_cons_prev = g_cons_maxres = 0;
+    int rc = http_recv_chunked(&r, &sk, 10000, 3000, script_set_timeout);
+    check("442329-byte iPhone shape is truncated, not complete", rc == HTTP_RECV_TRUNCATED, NULL);
+    check("timeout at chunk boundary is not EOF or parser poison",
+          r.timed_out && !r.eof && !r.poisoned && s.now_ms == 10000, NULL);
+    check("streaming preserves incomplete residue after four records",
+          g_cons_recs == 4 && g_cons_total == 442329 && sk.len == 53599, NULL);
+    free(sk.buf);
+  }
+
   /* --- 1. the exact field failure: answer /Ask, then drain with a budget shorter
      than the body's arrival. Must NOT silently continue: the drain has to report
      failure so the caller closes instead of reading the body as a request line. */

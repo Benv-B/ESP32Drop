@@ -1,12 +1,24 @@
 # The host suites: every parser and every piece of link-layer arithmetic, compiled from the
 # same headers the firmware uses, run on a laptop-class machine with ASan/UBSan. No board,
 # no arduino-cli. macOS because that is where the suites were written and run: cc is clang,
-# cpio(1) is BSD cpio, and tools/test-pack.sh compares against it.
+# cpio(1) is BSD cpio.
 name: host tests
 on:
   push:
   pull_request:
 jobs:
+  viewer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: host/requirements.txt
+      - run: python -m pip install -r host/requirements.txt
+      - name: USB framing, live preview and durable delivery
+        run: python -m unittest discover -s host -p "test_*.py" -v
   host:
     runs-on: macos-latest
     steps:
