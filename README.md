@@ -5,6 +5,19 @@
 
 # ESP32Drop
 
+## 本仓库：AirDrop 串口照片桥接
+
+基于 [s-iwaki-d/ESP32Drop](https://github.com/s-iwaki-d/ESP32Drop) 的定制版本，保留上游代码和许可证。
+新增 `SerialPhotoBridge` 固件示例与 Windows 本机照片查看器，实现：
+
+**iPhone AirDrop → ESP32-S3（8 MB PSRAM）→ UART/CH340 → 电脑保存原图并显示预览。**
+
+接线、编译、烧录、启动查看器和测试说明见 **[中文使用说明](host/README.md)**。
+已实机完成单张 iPhone 照片接收及串口 CRC 校验；连续传输稳定性与速度仍需优化。
+照片、原设备固件备份、日志和本地构建环境不纳入版本控制。
+
+以下为上游项目说明。
+
 **English** | [日本語](#日本語)
 
 A library and example sketches that do AirDrop on an ESP32-S3. Open the share sheet on a

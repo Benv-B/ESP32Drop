@@ -12,3 +12,11 @@
 logs/
 testdata/captures/
 testdata/dvzip_body.bin
+
+# Serial photo bridge: environments, private photos and original-device backups
+.venv/
+__pycache__/
+*.pyc
+received/
+backups/
+.ruff_cache/
