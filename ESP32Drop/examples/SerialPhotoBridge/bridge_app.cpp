@@ -7,6 +7,7 @@
 #include "esp_rom_crc.h"
 #include "esp_wifi.h"
 #include "bridge_app.h"
+#include "frame_controller.h"
 #include "bridge_write.h"
 #include "selftest_jpeg.h"
 
@@ -14,7 +15,15 @@
 #define PHOTO_BRIDGE_BAUD 921600
 #endif
 #if CONFIG_IDF_TARGET_ESP32C5
+#ifdef PHOTO_FRAME_REVC
+#if AWDL_AIRDROP_NO_IRIS
+#define PHOTO_BRIDGE_FIRMWARE "xiao-c5-frame-noiris-2"
+#else
+#define PHOTO_BRIDGE_FIRMWARE "xiao-c5-frame-usb-2"
+#endif
+#else
 #define PHOTO_BRIDGE_FIRMWARE "xiao-c5-radio-7-cleanup"
+#endif
 #define PHOTO_BRIDGE_CHIP "ESP32-C5"
 #define PHOTO_BRIDGE_STREAM_ENABLED "true"
 #else
@@ -23,7 +32,11 @@
 #define PHOTO_BRIDGE_STREAM_ENABLED "false"
 #endif
 #ifndef PHOTO_BRIDGE_NAME
+#ifdef PHOTO_FRAME_REVC
+#define PHOTO_BRIDGE_NAME "Photo Frame"
+#else
 #define PHOTO_BRIDGE_NAME "Photo Bridge"
+#endif
 #endif
 #if !ARDUINO_USB_MODE || !ARDUINO_USB_CDC_ON_BOOT
 #error "Photo bridge requires Hardware USB CDC and CDC On Boot (USBMode=hwcdc, CDCOnBoot=cdc)"
@@ -80,6 +93,7 @@ static bool send_header(uint8_t kind, uint32_t length, uint32_t crc) {
 }
 
 static void send_text(uint8_t kind, const char *text) {
+  if (!Serial) return; // unsolicited telemetry must not delay battery startup
   const uint32_t length = (uint32_t)strlen(text);
   const uint8_t *bytes = (const uint8_t *)text;
   if (send_header(kind, length, esp_rom_crc32_le(0, bytes, length)))
@@ -122,6 +136,7 @@ static bool wait_file_ack(uint32_t seq, bool durable, uint32_t *files = nullptr,
         unsigned long value = 0;
         if (strcmp(line, "LIVE") == 0) live_host = true;
         if (strcmp(line, "SAVE") == 0) saved_host = true;
+        frame_command(line);
         unsigned long count = 0;
         if (sscanf(line, durable ? "SAVED %lu %lu" : "HAVE %lu %lu", &value, &count) >= 1 && value == seq) {
           if (files) *files = (uint32_t)count;
@@ -257,6 +272,7 @@ static void usb_benchmark() {
 }
 
 static void send_status() {
+  if (!Serial) return;
   uint8_t radio_primary = 0;
   wifi_second_chan_t radio_secondary = WIFI_SECOND_CHAN_NONE;
   char radio_country[3] = {};
@@ -266,11 +282,12 @@ static void send_status() {
   struct AdStatus ad = {};
   struct AwdlStatus awdl = {};
   struct AwdlDiag diag = {};
-  if (ready) { ad_stats_read(&ad); awdl_status_read(&awdl); awdl_diag_read(&diag, false); }
+  if (ready) ad_stats_read(&ad);
+  if (ready && !frame_is_off()) { awdl_status_read(&awdl); awdl_diag_read(&diag, false); }
   Selection selection = {};
   AwdlWinState window = {};
   AwdlGaugeStatus gauge = {};
-  if (ready) {
+  if (ready && !frame_is_off()) {
     awdl_selection_read(&selection);
     awdl_winstate_read(&window);
     awdl_gauge_status_read(&gauge);
@@ -280,9 +297,10 @@ static void send_status() {
   live_available = preview.available;
   for (char *p = ad.file_errmsg; *p; ++p)
     if ((unsigned char)*p < 32 || *p == '"' || *p == '\\') *p = '?';
-  char json[3400];
+  static char json[4600];
+  char frame[1200]; frame_json(frame, sizeof(frame));
   const int length = snprintf(json, sizeof(json),
-      "{\"ready\":%s,\"name\":\"Photo Bridge\",\"uptime_ms\":%lu,"
+      "{\"ready\":%s,\"name\":\"" PHOTO_BRIDGE_NAME "\",\"uptime_ms\":%lu,"
       "\"bridge_protocol\":1,\"archive_stream_enabled\":" PHOTO_BRIDGE_STREAM_ENABLED ","
       "\"transport\":\"usb_hwcdc\",\"flash_bytes\":%lu,"
       "\"psram_bytes\":%lu,\"psram_free\":%lu,\"internal_free\":%lu,"
@@ -312,8 +330,8 @@ static void send_status() {
       "\"gauge_locked\":%d,\"gauge_health\":%d,\"gauge_skipped\":%lu,\"sync_frames\":%lu,"
       "\"measured_mask\":%u,\"sequence_mask\":%u,\"master_mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\","
       "\"bssid_filter_enabled\":%u,\"rx_to_us\":%lu,\"rx_to_us_matched\":%lu,\"rx_to_us_retry\":%lu,"
-      "\"rx_match_mask\":%u,\"sync_psf\":%lu,\"sync_mif\":%lu}",
-      ready ? "true" : "false", (unsigned long)millis(),
+      "\"rx_match_mask\":%u,\"sync_psf\":%lu,\"sync_mif\":%lu,\"receiver_flags\":%u,\"frame\":%s}",
+      (ready && !frame_is_off()) ? "true" : "false", (unsigned long)millis(),
       (unsigned long)ESP.getFlashChipSize(), (unsigned long)ESP.getPsramSize(),
       (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
       (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
@@ -357,12 +375,14 @@ static void send_status() {
       selection.addr[0], selection.addr[1], selection.addr[2], selection.addr[3], selection.addr[4], selection.addr[5],
       (unsigned)AWDL_C5_BSSID_FILTER, (unsigned long)diag.rx_to_us,
       (unsigned long)diag.rx_to_us_matched, (unsigned long)diag.rx_to_us_retry,
-      (unsigned)diag.rx_match_mask, (unsigned long)diag.sync_psf, (unsigned long)diag.sync_mif);
+      (unsigned)diag.rx_match_mask, (unsigned long)diag.sync_psf, (unsigned long)diag.sync_mif,
+      (unsigned)AWDL_RECEIVER_FLAGS_VALUE, frame);
   if (length > 0 && (size_t)length < sizeof(json)) send_text(FRAME_STATUS, json);
   else send_text(FRAME_LOG, "Status JSON buffer too small");
 }
 
 void bridge_setup() {
+  frame_setup();
   // Both XIAO targets use their native USB Serial/JTAG CDC peripheral.
   // Baud is a host API placeholder; native USB throughput is not UART baud-limited.
   Serial.setRxBufferSize(256);
@@ -394,20 +414,25 @@ void bridge_setup() {
     send_text(FRAME_LOG, boot_error); send_status(); return;
   }
   ready = true;
-  send_text(FRAME_LOG, "Ready. On iPhone: Photos -> Share -> AirDrop -> Photo Bridge");
+  send_text(FRAME_LOG, "Ready. On iPhone: Photos -> Share -> AirDrop -> " PHOTO_BRIDGE_NAME);
   send_status();
 }
 
 static void read_commands() {
   // A deterministic local test proves USB/display only, never AirDrop compatibility.
-  static char command[16];
+  static char command[64];
   static size_t used = 0;
+  static bool overflow = false;
   while (Serial.available() > 0) {
     const char c = (char)Serial.read();
     if (c == '\n') {
       command[used] = 0;
+      if (overflow) { used = 0; overflow = false; continue; }
+      if (frame_command(command)) { used = 0; continue; }
+      if (frame_is_off()) { used = 0; continue; }
       if (strcmp(command, "LIVE") == 0) live_host = true;
       if (strcmp(command, "SAVE") == 0) saved_host = true;
+      if (ad_shutdown_busy()) { used = 0; continue; }
       if (strcmp(command, "BENCH") == 0) usb_benchmark();
       if (strcmp(command, "STREAMTEST") == 0)
         send_text(FRAME_LOG, ad_stream_self_test() ? "Synthetic 7 MiB stream test started; no Wi-Fi measured" : "Stream test unavailable/busy");
@@ -421,7 +446,7 @@ static void read_commands() {
       used = 0;
     } else if (c != '\r') {
       if (used < sizeof(command) - 1) command[used++] = c;
-      else used = 0;
+      else overflow = true;
     }
   }
 }
@@ -432,11 +457,12 @@ void bridge_loop() {
   // Losing the USB connection must never downgrade a pending file to fire-and-forget.
   // Negotiate before polling a completed archive or sending another chunk.
   read_commands();
-  bool forwarded_live = forward_stream();
+  bool forwarded_live = !frame_is_off() && forward_stream();
 #if !CONFIG_IDF_TARGET_ESP32C5
   for (int i = 0; i < 4 && forward_live_chunk(); ++i) forwarded_live = true;
 #endif
-  if (ready) ad_poll();
+  if (ready && !frame_is_off()) ad_poll();
+  frame_tick(ready);
   char line[200];
   int budget = 8;
   while (ready && Serial && budget-- > 0 && ad_diag_read_line(line, sizeof(line)))
@@ -449,5 +475,5 @@ void bridge_loop() {
     last_status = millis(); send_status();
   }
   // Drain accumulated records promptly; keep idle polling inexpensive.
-  delay(forwarded_live ? 1 : 10);
+  delay((forwarded_live || frame_is_off()) ? 1 : 10);
 }

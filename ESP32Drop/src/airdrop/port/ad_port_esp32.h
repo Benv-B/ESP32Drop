@@ -132,6 +132,13 @@ void ad_poll(void);
 /* True once ad_begin() has claimed this device for receiving. */
 bool ad_role_is_receiver(void);
 
+/* Power control: close admission only between complete TLS/jobs and with no
+ * retained archive. Once closed, restart the MCU to receive again. Wait for
+ * quiesced before awdl_end(); the listener then owns no sockets/netif work. */
+bool ad_shutdown_busy(void);
+bool ad_shutdown_if_idle(void);
+bool ad_shutdown_quiesced(void);
+
 void ad_stats_read(struct AdStatus *out);
 
 /* The SMALLEST free stack the TLS listener task has ever had, in bytes, or 0 before it

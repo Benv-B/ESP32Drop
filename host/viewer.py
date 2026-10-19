@@ -385,11 +385,29 @@ class SerialReader(threading.Thread):
                 self.file_queue.task_done()
 
     def self_test(self):
+        with self.gallery.lock:
+            board = self.gallery.board
+            if board.get("rx_active") or board.get("delivery_pending") or board.get("frame", {}).get("off_requested"):
+                raise RuntimeError("请等待收图完成，或先恢复接收")
         with self.write_lock:
             if self.connection is None or not self.connection.is_open:
                 raise RuntimeError("serial port is not connected")
             self.connection.write(b"TEST\n")
         self.gallery.log("Requested synthetic JPEG test (this is NOT an iPhone transfer)")
+
+    def frame_control(self, action: str):
+        commands = {"wake": b"FRAME WAKE\n", "hold": b"FRAME HOLD\n",
+                    "auto": b"FRAME AUTO\n", "off": b"FRAME OFF\n"}
+        if action not in commands:
+            raise ValueError("unknown frame action")
+        with self.gallery.lock:
+            if not self.gallery.board.get("frame", {}).get("enabled"):
+                raise RuntimeError("请先烧录 Photo Frame RevC 整合固件")
+        with self.write_lock:
+            if self.connection is None or not self.connection.is_open:
+                raise RuntimeError("serial port is not connected")
+            self.connection.write(commands[action])
+        self.gallery.log(f"相框控制已发送：{action}；实际状态以开发板回报为准")
 
     def handle_status(self, status: dict):
         uptime = status.get("uptime_ms", 0)
@@ -411,7 +429,17 @@ class SerialReader(threading.Thread):
             if self.connection is not None:
                 self.connection.write(b"LIVE\nSAVE\n")
         with self.gallery.lock:
+            old_frame = self.gallery.board.get("frame", {})
             self.gallery.board = status
+        frame = status.get("frame", {})
+        if frame.get("enabled"):
+            if frame.get("boot") != old_frame.get("boot"):
+                wake = {"nfc_field": "NFC 触碰", "usb_command": "电脑恢复命令", "reset": "上电或其他复位"}.get(frame.get("wake_reason"), "旧固件未记录")
+                self.gallery.log(f"相框启动 #{frame.get('boot')} · {status.get('firmware', '')} · 启动原因：{wake}")
+            if frame.get("state") != old_frame.get("state"):
+                self.gallery.log(f"相框状态：{frame.get('state')} · 原因：{frame.get('reason') or '-'}")
+            if frame.get("rf_seen") and not old_frame.get("rf_seen"):
+                self.gallery.log("NFC：本次启动已检测到手机射频场")
 
     def run(self):
         self.file_worker.start()
@@ -543,11 +571,15 @@ def handler_factory(gallery: Gallery, reader: SerialReader):
             if self.headers.get("Origin") not in (None, expected_origin):
                 self.reply(b"Forbidden", "text/plain", 403)
                 return
-            if self.path != "/api/self-test":
+            frame_actions = {"/api/frame/" + action: action for action in ("wake", "hold", "auto", "off")}
+            if self.path != "/api/self-test" and self.path not in frame_actions:
                 self.reply(b"Not found", "text/plain", 404)
                 return
             try:
-                reader.self_test()
+                if self.path in frame_actions:
+                    reader.frame_control(frame_actions[self.path])
+                else:
+                    reader.self_test()
                 self.reply(b'{"ok": true}', "application/json")
             except Exception as exc:
                 self.reply(json.dumps({"error": str(exc)}).encode(), "application/json", 503)

@@ -42,6 +42,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include "awdl_window.h"
+#include "../../ESP32DropConfig.h"
 
 /* Buffer floor the caller must provide. The builder emits a variable-length frame and
  * does NOT bounds-check each of its ~180 writes -- that would be 180 branches guarding
@@ -214,13 +215,15 @@ static size_t awdl_build_mif(uint8_t *b, size_t cap, const struct AwdlMifParams 
   // Note the three hand-written lengths that all shrink by 2 with the string:
   // TLV len 35->33, data_len 13->11, and the label length 0x0C->0x0A. Verified by
   // walking the firmware's own MIFHEX dump.
-  b[p++]=0x02; b[p++]=0x21; b[p++]=0x00;           // type2, TLV len=33 (LE)
+  const uint8_t txt_len = (uint8_t)(sizeof(AWDL_RECEIVER_FLAGS_TEXT) - 1);
+  // Derive all three lengths together; the optional no-IRIS value is one byte shorter.
+  b[p++]=0x02; b[p++]=(uint8_t)(23 + txt_len); b[p++]=0x00;
   b[p++]=0x10; b[p++]=0x00;                         // name_len=16
   b[p++]=0x0C; memcpy(&b[p],m->instance,12); p+=12; b[p++]=0xC0; b[p++]=0x07;
   b[p++]=0x10;                                     // TXT
-  b[p++]=0x0B; b[p++]=0x00;                         // data_len=11
+  b[p++]=(uint8_t)(1 + txt_len); b[p++]=0x00;
   b[p++]=0x00; b[p++]=0x00;                         // class
-  b[p++]=0x0A; memcpy(&b[p],"flags=1019",10); p+=10;
+  b[p++]=txt_len; memcpy(&b[p],AWDL_RECEIVER_FLAGS_TEXT,txt_len); p+=txt_len;
 
   // ---- ht_capabilities (type 7) content=8 ----
   b[p++]=0x07; b[p++]=0x08; b[p++]=0x00;

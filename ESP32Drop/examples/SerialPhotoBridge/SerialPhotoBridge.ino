@@ -1,4 +1,4 @@
-// Native USB CDC photo bridge for XIAO ESP32S3 (8 MB Flash / 8 MB Octal PSRAM).
+// Native USB photo bridge for XIAO ESP32-S3 / C5; optional RevC frame control.
 #include <ESP32AWDL.h>
 #include <ESP32Drop.h>
 #include "bridge_app.h"

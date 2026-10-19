@@ -4,10 +4,14 @@ param(
     [ValidateSet("S3", "C5")][string]$Board = "S3",
     [ValidateSet(6, 44, 149)][int]$Channel = 6,
     [ValidatePattern("^(01|[A-Z]{2})$")][string]$Country = "01",
-    [switch]$DisableAwdlBssid
+    [switch]$DisableAwdlBssid,
+    [switch]$RevC,
+    [switch]$DisableIris
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
+if ($RevC -and $Board -ne "C5") { throw "RevC requires -Board C5." }
+if ($DisableIris -and -not $RevC) { throw "The no-IRIS experiment requires -RevC." }
 if ($Board -eq "S3" -and $Channel -ne 6) { throw "ESP32-S3 does not support 5 GHz." }
 if ($Board -ne "C5" -and $DisableAwdlBssid) { throw "DisableAwdlBssid is C5-only." }
 if (-not $Fqbn) {
@@ -19,6 +23,8 @@ if (-not $Fqbn) {
     }
 }
 $buildDir = if ($Board -eq "C5") { ".build-serial-c5-ch$Channel" } else { ".build-serial" }
+if ($RevC) { $buildDir = ".build-photo-frame-c5-ch$Channel" }
+if ($DisableIris) { $buildDir = ".build-photo-frame-noiris-c5-ch$Channel" }
 if (-not $ArduinoCli) { $ArduinoCli = Join-Path $root ".build-tools/arduino-cli.exe" }
 if (-not (Test-Path $ArduinoCli)) { throw "Install arduino-cli into .build-tools first; see host/README.md." }
 $config = Join-Path $root ".build-tools/arduino.yaml"
@@ -34,6 +40,8 @@ if (-not $core -or $core.installed_version -ne "3.3.8") {
 $extraProperties = @()
 $countryCode = $Country.ToUpperInvariant()
 $radioFlags = "-DAWDL_RADIO_CHANNEL=$Channel -DAWDL_COUNTRY_0=$([int][char]$countryCode[0]) -DAWDL_COUNTRY_1=$([int][char]$countryCode[1])"
+if ($RevC) { $radioFlags += " -DPHOTO_FRAME_REVC=1" }
+if ($DisableIris) { $radioFlags += " -DAWDL_AIRDROP_NO_IRIS=1" }
 if ($Board -eq "C5") {
     # Required for the measured hardware ACK fix; the private ABI is SDK-pinned.
     # Disabling is for diagnostics only, not the normal build.
@@ -47,7 +55,7 @@ if ($Board -eq "C5") {
     if (-not (Test-Path $rvTarget)) { throw "Pinned RISC-V toolchain missing: $rvTarget" }
     if (-not (Test-Path $rvShort)) { New-Item -ItemType Junction -Path $rvShort -Target $rvTarget | Out-Null }
     $rvLink = Get-Item -LiteralPath $rvShort
-    if ($rvLink.LinkType -ne "Junction" -or [IO.Path]::GetFullPath($rvLink.Target[0]) -ne [IO.Path]::GetFullPath($rvTarget)) {
+    if ($rvLink.LinkType -ne "Junction" -or [IO.Path]::GetFullPath(@($rvLink.Target)[0]) -ne [IO.Path]::GetFullPath($rvTarget)) {
         throw "Expected $rvShort to be a junction to the pinned RISC-V toolchain."
     }
     $extraProperties = @("--build-property", "compiler.path=$($rvShort.Replace('\', '/'))/bin/")

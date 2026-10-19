@@ -1,5 +1,16 @@
 #pragma once
 
+// Optional measured experiment, not an assertion that iOS will omit video.
+// OpenDrop config.py names 0x40 SUPPORTS_IRIS. Keep every other capability bit.
+// One shared string is used by both AWDL service TLVs and mDNS TXT records.
+#if defined(AWDL_AIRDROP_NO_IRIS) && AWDL_AIRDROP_NO_IRIS
+#define AWDL_RECEIVER_FLAGS_TEXT "flags=955"
+#define AWDL_RECEIVER_FLAGS_VALUE 955
+#else
+#define AWDL_RECEIVER_FLAGS_TEXT "flags=1019"
+#define AWDL_RECEIVER_FLAGS_VALUE 1019
+#endif
+
 // One fixed AWDL social channel per build. This is not channel hopping or bonding.
 // 5 GHz builds are experimental and require a radio with 5 GHz support.
 #ifndef AWDL_RADIO_CHANNEL

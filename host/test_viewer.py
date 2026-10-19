@@ -8,6 +8,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from unittest.mock import Mock
 
 import serial
 
@@ -43,6 +44,58 @@ class UsbPortTests(unittest.TestCase):
 
 
 class ViewerTests(unittest.TestCase):
+    def test_frame_controls_are_whitelisted_and_require_integrated_firmware(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gallery = Gallery(Path(tmp), "TEST", 921600)
+            reader = SerialReader(gallery)
+            reader.connection = Mock(is_open=True)
+            with self.assertRaises(RuntimeError):
+                reader.frame_control("off")
+            gallery.board = {"frame": {"enabled": True}}
+            for action in ("hold", "auto", "off", "wake"):
+                reader.frame_control(action)
+                reader.connection.write.assert_called_with(f"FRAME {action.upper()}\n".encode())
+            with self.assertRaises(ValueError):
+                reader.frame_control("off\nTEST")
+            reader.connection.is_open = False
+            with self.assertRaises(RuntimeError):
+                reader.frame_control("off")
+
+    def test_self_test_refused_during_receive_pending_save_and_off(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gallery = Gallery(Path(tmp), "TEST", 921600)
+            reader = SerialReader(gallery)
+            reader.connection = Mock(is_open=True)
+            for state in ({"rx_active": True}, {"delivery_pending": True},
+                          {"frame": {"off_requested": True}}):
+                gallery.board = state
+                with self.assertRaises(RuntimeError):
+                    reader.self_test()
+            reader.connection.write.assert_not_called()
+
+    def test_frame_http_controls_and_cross_origin_rejection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gallery = Gallery(Path(tmp), "TEST", 921600)
+            gallery.board = {"frame": {"enabled": True}}
+            reader = SerialReader(gallery)
+            reader.connection = Mock(is_open=True)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), handler_factory(gallery, reader))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+            try:
+                for path, origin, expected in (
+                    ("/api/frame/off", "http://foreign.invalid", 403),
+                    ("/api/frame/anything", None, 404),
+                    ("/api/frame/hold", f"http://127.0.0.1:{server.server_port}", 200)):
+                    connection.request("POST", path, headers={"Origin": origin} if origin else {})
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, expected)
+                    response.read()
+                reader.connection.write.assert_called_once_with(b"FRAME HOLD\n")
+            finally:
+                connection.close(); server.shutdown(); server.server_close(); thread.join(timeout=2)
+
     def test_save_original_preview_and_safe_paths(self):
         image = Image.new("RGB", (20, 10), (20, 120, 200))
         output = io.BytesIO()

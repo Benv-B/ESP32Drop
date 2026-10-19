@@ -1,18 +1,34 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Photo Bridge · iPhone 照片接收</title>
+<title>Photo Frame · 相框收图预览</title>
 <style>
 :root{color-scheme:dark;font-family:system-ui,"Microsoft YaHei",sans-serif;background:#10141e;color:#e9edf6}body{max-width:1100px;margin:36px auto;padding:0 22px}h1{margin-bottom:8px}.sub{color:#99a7bd}section{background:#1a2130;border:1px solid #303b51;border-radius:14px;padding:20px;margin:20px 0}.stats{display:flex;flex-wrap:wrap;gap:20px}.pill{color:#82dab5}button,a{background:#344c77;color:white;border:0;border-radius:8px;padding:10px 16px;cursor:pointer;text-decoration:none}button:disabled{opacity:.5;cursor:wait}#gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:18px}.card{background:#1a2130;border:1px solid #303b51;border-radius:12px;overflow:hidden}.card img{width:100%;height:240px;object-fit:contain;background:#090c13}.card .info{padding:16px}.card h3{overflow-wrap:anywhere;margin:0 0 8px}.card small{display:block;color:#9aa9bf;margin-bottom:16px}.test{color:#ffcf79}pre{white-space:pre-wrap;word-break:break-word;font-size:12px;max-height:280px;overflow:auto;color:#aebbd0}#message{color:#b8c7df}#empty{color:#94a4bd;padding:24px}.error{color:#ff9b9b}
 </style></head><body>
-<h1>Photo Bridge</h1><div class="sub">iPhone 隔空投送 → ESP32-S3 → USB → 本机照片显示</div>
+<h1>Photo Frame</h1><div class="sub">触碰 NFC 唤醒 → iPhone 隔空投送 → ESP32-C5 → USB 电脑预览</div>
+<section id="frame-panel" hidden><div class="stats"><strong id="frame-state"></strong><span id="frame-nfc"></span><span id="frame-timer"></span></div><p id="frame-note"></p><div class="stats"><button data-frame="wake">恢复接收 / 延长等待</button><button data-frame="hold">保持唤醒</button><button data-frame="auto">恢复自动关机</button><button data-frame="off">结束接收并关机</button></div><p class="sub">当前电脑代替屏幕：请保持 USB 和本页面服务运行。关机按钮会等待正在接收的文件完成。</p></section>
 <section><div class="stats"><strong id="connection">正在连接页面…</strong><span id="memory"></span><span id="link"></span></div><p id="message">等待开发板状态。</p><button id="test">测试板子 → 电脑显示</button><p class="sub">此按钮让板子发送一张蓝色测试图，只验证USB链路，不代表 iPhone AirDrop 已验证。</p></section>
 <section><strong>接收中的照片</strong><p id="live-status">等待图片数据。</p><progress id="live-progress" max="1" value="0" style="width:100%"></progress><p id="pipeline" class="sub"></p><p id="live-note" class="sub">JPEG / PNG 可尝试边接收边预览；HEIC 等格式需等完整文件。这里展示电脑解码结果，不代表 Spectra 6 的实际刷新过程。</p><img id="live-image" hidden alt="接收中的临时图片，尚未完成校验" style="width:100%;max-height:540px;object-fit:contain;background:#090c13"></section>
-<section><strong>iPhone 测试步骤</strong><ol><li>打开 Wi-Fi 和蓝牙，保持手机解锁，先靠近板子。</li><li>先用一张小照片或截图：照片 → 分享 → 隔空投送 → <b>Photo Bridge</b>。</li><li>如果设备不出现，保持分享页面打开，观察下方 AWDL、发现和 TLS 状态。</li><li>新固件支持接收中预览，完整校验后照片进入相册。默认文件包上限为 6 MiB。</li></ol><span class="sub">此测试接收器自动接受附近发送者，不验证 Apple 身份；请仅在可信环境使用。原图只保存到电脑，板子断电不会保留。</span></section>
+<section><strong>iPhone 测试步骤</strong><ol><li>打开 Wi-Fi 和蓝牙，亮屏触碰 NFC，然后打开照片；无需 NFC Tools。</li><li>先用一张小照片或截图：照片 → 分享 → 隔空投送 → <b id="receiver-name">Photo Frame</b>。</li><li>如果设备不出现，保持分享页面打开，观察下方 AWDL、发现和 TLS 状态。</li><li>原图完整校验并保存后显示；C5 分块接收的解包文件包上限为 128 MiB。</li></ol><span class="sub">此测试接收器自动接受附近发送者，不验证 Apple 身份；请仅在可信环境使用。原图只保存到电脑，当前不执行屏幕 SPI 输出或 ESP 图像转换。</span></section>
 <div id="gallery"></div><div id="empty">还没有收到照片。</div>
 <section><strong>运行日志</strong><pre id="log"></pre><details><summary>完整开发板状态</summary><pre id="state"></pre></details></section>
 <script>
 const $=id=>document.getElementById(id);let shown='';
 let liveRevision=-1;
+function renderFrame(b,connected){
+ const f=b.frame||{};$('frame-panel').hidden=!f.enabled;
+ if(!f.enabled)return;
+ const labels={waiting:'等待手机照片',receiving:'正在通信 / 接收与保存',saved:'照片已保存',retry:'上次未完成，可以重新发送',waiting_to_off:'等待安全关机条件',stopping:'正在结束接收服务',off_requested:'已请求断电'};
+ $('frame-state').textContent=labels[f.state]||f.state;
+ $('frame-nfc').textContent=f.nfc_ok?'NFC 通信正常 · '+(f.rf_present?'正在检测到手机射频场':f.off_requested?(f.wake_armed?'唤醒检测已就绪；当前无射频场':'等待射频场消失后重新允许唤醒'):f.wake_reason==='nfc_field'?'本次由 NFC 唤醒；当前无射频场':f.rf_seen?'本次已捕获 NFC 信号；当前无射频场':'本次尚未捕获 NFC 信号'):'NFC 读取失败 · 自动关机等待恢复';
+ $('frame-timer').textContent=f.off_requested?'':f.auto_off?'空闲倒计时 '+f.remaining_s+' 秒':'保持唤醒，已暂停自动关机';
+ $('frame-note').textContent=f.off_requested?'电池断电指令已发出；USB 仍可为主控供电。这不代表已测得整板断电。点击“恢复接收”或再次触碰 NFC 可重新启动。':f.state==='waiting_to_off'?'正在等待通信结束、手机移开和 NFC 读数稳定。':'默认等待 3 分钟；照片成功保存后再等待 30 秒，期间可继续发送。';
+ for(const button of document.querySelectorAll('[data-frame]'))button.disabled=!connected||f.state==='stopping'||(f.off_requested&&button.dataset.frame!=='wake');
+}
+for(const button of document.querySelectorAll('[data-frame]'))button.onclick=async()=>{
+ button.disabled=true;
+ try{const r=await fetch('/api/frame/'+button.dataset.frame,{method:'POST'});const result=await r.json();if(!r.ok)alert(result.error||'控制请求失败')}
+ catch(e){alert(e.message)}
+};
 function renderPipeline(b){
  const parts=[];
  if(b.receive_core>=0)parts.push('接收 / 解包：核心 '+b.receive_core+' · USB：核心 '+b.usb_core+' · '+b.cpu_mhz+' MHz');
@@ -25,7 +41,7 @@ function renderLive(l,b,files){
  let text=labels[l.state]||'等待图片数据';
  if(b.rx_active&&l.state!=='receiving')text=b.live_enabled===false?'正在恢复实时 USB 连接…':'ESP 正在接收，等待首个可解包图片片段…';
  if(b.live_failed&&b.rx_active)text='实时 USB 输出中断，完整接收后将补传原图';
- if(l.streaming)text='正在接收照片及视频，完成后显示图片';
+ if(l.streaming)text='正在接收文件，完成后显示照片';
  if(l.state==='receiving')text+=(l.name?' · '+l.name:'')+' · 已转发 '+size(l.archive_bytes)+' · '+((l.bytes_per_s||0)/1024).toFixed(1)+' KiB/s（解包数据平均）';
  $('live-status').textContent=text;
  $('live-progress').value=l.state==='saved'?1:l.total?l.received/l.total:0;
@@ -41,7 +57,8 @@ function renderFiles(files){const key=files.map(f=>f.id).join();if(key===shown)r
 async function refresh(){try{const r=await fetch('/api/state');if(!r.ok)throw Error(r.status);const s=await r.json(),b=s.board;$('connection').textContent=b.transport==='replay'?'本地限速回放 · 未使用 ESP / USB':s.connected?s.port+' 已连接 · '+(b.transport==='usb_hwcdc'?'原生 USB CDC':s.baud+' baud'):'USB未连接：'+s.port;$('connection').className=s.connected||b.transport==='replay'?'pill':'error';$('test').hidden=b.transport==='replay';$('memory').textContent=b.psram_bytes?'PSRAM '+size(b.psram_bytes)+' · 剩余 '+size(b.psram_free):'';$('link').textContent=b.ready?'AWDL '+(b.locked?'已同步':b.have_master?'同步中':'等待 iPhone')+' · 已转发 '+b.forwarded+' 个文件':'';const [done,total]=s.serial_progress;
 if(b.chip)$('memory').textContent=b.chip+' · '+$('memory').textContent;
 if(b.ready&&b.radio_channel)$('link').textContent+=(b.radio_channel>14?' · 5 GHz':' · 2.4 GHz')+' / 信道 '+(b.radio_actual_channel||b.radio_channel)+(b.radio_country?' · '+b.radio_country:'');
-let msg=b.boot_error||(!b.ready?'等待板子启动 / 检查烧录与复位':'已就绪，在 iPhone 上选择 Photo Bridge');
+$('receiver-name').textContent=b.name||'Photo Frame';renderFrame(b,s.connected);
+let msg=b.boot_error||(!b.ready?'等待板子启动 / 检查烧录与复位':'已就绪，在 iPhone 上选择 '+(b.name||'Photo Frame'));
 if(b.file_error&&!b.rx_active)msg=b.file_error==='handler refused a file'?'ESP 已收图，但向电脑交付失败；旧固件需重新投送':'上次接收未完成：'+b.file_error+'（已接收 '+size(b.rx_bytes)+'）';
 if(b.rx_active){msg='手机 → ESP：正在接收 '+size(b.rx_bytes);if(s.live?.state==='receiving')msg+=' ｜ 已同步到电脑 '+size(s.live.archive_bytes)}
 else if(total)msg='ESP → 电脑：USB 转发 '+Math.min(100,100*done/total).toFixed(0)+'%（手机投送完成后，此步骤仍可能继续）';
@@ -49,6 +66,7 @@ else if(s.live?.state==='verified')msg='电脑：原图校验通过，正在解�
 else if(s.live?.state==='saved')msg='电脑：图片已校验并保存';
 if(b.delivery_pending&&!b.rx_active)msg='ESP 已收图，等待电脑确认保存'+(b.delivery_retries?'；已保留图片，正在重试 USB 交付':'');
 if(b.transport==='replay')msg='软件模拟：按设定速度输入数据，不能用来衡量无线或屏幕速度';
+if(b.frame?.off_requested)msg='接收已结束；点击“恢复接收”重新启动。';
 $('message').textContent=msg;$('log').textContent=s.logs.join('\n');$('log').scrollTop=$('log').scrollHeight;$('state').textContent=JSON.stringify(b,null,2);renderFiles(s.files);renderPipeline(b);renderLive(s.live||{state:"idle"},b,s.files)}catch(e){$('connection').textContent='电脑端服务不可用：'+e.message;$('connection').className='error'}}
 $('test').onclick=async()=>{const b=$('test');b.disabled=true;try{const r=await fetch('/api/self-test',{method:'POST'});const result=await r.json();if(!r.ok)alert(result.error||'测试请求失败')}catch(e){alert(e.message)}finally{b.disabled=false}};
 const originalRefresh=refresh;

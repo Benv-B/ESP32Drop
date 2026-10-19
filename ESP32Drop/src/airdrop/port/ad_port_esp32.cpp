@@ -43,6 +43,7 @@
 /* The AirDrop layer accesses AWDL only through its public header. */
 #include "../../ESP32AWDL.h"
 #include "ad_port_esp32.h"
+#include "../core/ad_power_gate.h"
 #include "ad_stream_esp32.h"
 #include "../core/airdrop_cert.h"
 #include "../core/ad_http.h"
@@ -279,7 +280,7 @@ static int build_mdns_msg(uint8_t *d) {
   *p++ = 0; *p++ = 16; *p++ = 0x80; *p++ = 0x01;
   *p++ = 0; *p++ = 0; *p++ = 0x00; *p++ = 0x78;
   rl = p; p += 2; rs = p;
-  const char *txt = "flags=1019"; uint8_t tl = strlen(txt);   // 0x3FB = macOS "Everyone" default bitmask (Discover bit set). The DvZip bit does not gate the /Upload format -- modern macOS/iOS send DvZip regardless -- so keep the validated value the sender's removeInvalidNodes accepts.
+  const char *txt = AWDL_RECEIVER_FLAGS_TEXT; uint8_t tl = strlen(txt);
   *p++ = tl; memcpy(p, txt, tl); p += tl;
   { uint16_t n = p - rs; rl[0] = n >> 8; rl[1] = n; }
   // AAAA: host -> our link-local
@@ -612,6 +613,9 @@ static volatile uint32_t g_rx_touch_ms = 0;
 static volatile bool     g_rx_active   = false;   // transfer in progress: "Receiving" UI
 static volatile uint32_t g_rx_bytes    = 0;       // compressed bytes received so far
 static std::atomic<bool> g_upload_running{false};
+static AdPowerGate g_power_gate;
+static std::atomic<bool> g_listener_parked{false};
+
 static std::atomic<uint32_t> g_rx_started_ms{0}, g_rx_elapsed_ms{0};
 static std::atomic<uint32_t> g_decode_us{0}, g_decode_max_us{0};
 static std::atomic<int> g_listener_core{-1};
@@ -622,6 +626,14 @@ static TaskHandle_t g_listener_task = nullptr;
 // bounds-checked code fed by a remote sender (ad_cpio.h, 35 host checks under ASan), and
 // there is no reason to run it inside the task that is holding the TLS session open.
 static std::atomic<bool> g_arch_ready{false};     // release/acquire ownership across cores
+bool ad_shutdown_busy(void) {
+  return g_power_gate.busy() || g_upload_running.load() || g_arch_ready.load();
+}
+bool ad_shutdown_if_idle(void) {
+  if (g_upload_running.load() || g_arch_ready.load()) return false;
+  return g_power_gate.close();
+}
+bool ad_shutdown_quiesced(void) { return g_listener_parked.load(); }
 static uint8_t          *g_arch_block  = nullptr; // PSRAM block, freed after delivery
 static const uint8_t    *g_arch_buf    = nullptr; // the cpio within the block
 static volatile uint32_t g_arch_len    = 0;
@@ -1625,13 +1637,17 @@ static void stream_test_task(void *) {
   if (p.out) heap_caps_free(p.out);
   g_rx_active = false; g_rx_elapsed_ms = millis() - g_rx_started_ms.load();
   g_upload_running = false;
+  g_power_gate.leave();
   vTaskDelete(nullptr);
 }
 bool ad_stream_self_test(void) {
-  if (!g_stream_req || g_rx_active || g_arch_ready || g_upload_running.exchange(true)) return false;
+  if (!g_power_gate.enter()) return false;
+  if (!g_stream_req || g_rx_active || g_arch_ready || g_upload_running.exchange(true)) {
+    g_power_gate.leave(); return false;
+  }
   g_rx_active = true; g_rx_started_ms = millis(); g_rx_bytes = 0; g_img_errmsg[0] = 0;
   if (xTaskCreate(stream_test_task, "stream_test", 6144, nullptr, 1, nullptr) != pdPASS) {
-    g_rx_active = false; g_upload_running = false; return false;
+    g_rx_active = false; g_upload_running = false; g_power_gate.leave(); return false;
   }
   return true;
 }
@@ -1736,7 +1752,14 @@ static void tcp_listen_task(void *) {
   int conn[MAXC]; uint32_t born[MAXC];
   for (int i = 0; i < MAXC; i++) conn[i] = -1;
   int active = -1; uint32_t t_data = 0, t_hs0 = 0;
+  bool power_owned = false;
   for (;;) {
+    if (g_power_gate.closed()) {
+      for (int i = 0; i < MAXC; ++i) if (conn[i] >= 0) { close(conn[i]); conn[i] = -1; }
+      if (ls >= 0) { close(ls); ls = -1; g_listen_fd = -1; }
+      g_listener_parked = true;
+      vTaskDelay(pdMS_TO_TICKS(100)); continue;
+    }
     if (!g_tls_ready) { vTaskDelay(pdMS_TO_TICKS(1000)); airdrop_tls_init(); continue; }
     if (ls < 0) {
       ls = socket(AF_INET6, SOCK_STREAM, 0);
@@ -1824,6 +1847,8 @@ static void tcp_listen_task(void *) {
                       nc, rd, cand, active, (unsigned long)g_tcp_accept); } }
 #endif
     if (adopt) {
+      if (!power_owned) power_owned = g_power_gate.enter();
+      if (!power_owned) continue; // shutdown won the race; park at loop top
       mbedtls_ssl_session_reset(&g_ssl);
       g_net.fd = conn[cand];
 #ifdef HTTP_TRACE
@@ -1877,6 +1902,7 @@ static void tcp_listen_task(void *) {
       close(conn[active]); conn[active] = -1; active = -1;
       mbedtls_ssl_session_reset(&g_ssl);
     }
+    if (active < 0 && power_owned) { g_power_gate.leave(); power_owned = false; }
   }
 }
 

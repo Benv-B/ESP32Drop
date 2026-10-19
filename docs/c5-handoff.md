@@ -1,5 +1,7 @@
 # C5 换电脑开发交接
 
+2026-10-19：RevC 相框的 NFC / 电源控制与 USB 收图整合说明见 [相框软件使用说明](photo-frame.md)。以下保留原无线基线的历史验证记录，不代表整合版已通过相同的实机投送验证。
+
 本分支 `feat/xiao-esp32c5-awdl` 保存 Wi-Fi 6 实验前的清理版源码，固件标识 `xiao-c5-radio-7-cleanup`。适用 XIAO ESP32-C5，8 MB Flash / 8 MB PSRAM，中国大陆 CN / 信道 149，当前目标是原生 AirDrop 接收静态照片。USB 是现阶段消费者，SPI 尚未实现。
 
 ## 已验证到哪里
