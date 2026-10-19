@@ -29,6 +29,7 @@
 #include "freertos/queue.h"
 #include "lwip/sockets.h"
 #include "esp_heap_caps.h"    /* heap_caps_malloc(..., MALLOC_CAP_SPIRAM): decode in PSRAM */
+#include "esp_rom_crc.h"
 
 #include "mbedtls/ssl.h"
 #include "mbedtls/entropy.h"
@@ -42,15 +43,16 @@
 /* The AirDrop layer accesses AWDL only through its public header. */
 #include "../../ESP32AWDL.h"
 #include "ad_port_esp32.h"
+#include "ad_stream_esp32.h"
 #include "../core/airdrop_cert.h"
 #include "../core/ad_http.h"
 #include "../core/ad_serve.h"
 #include "../core/ad_bplist.h"
 #include "../core/ad_dvzip.h"
 
-/* gunzip via the ESP32-S3 mask-ROM miniz (tinfl). This is NOT an external package: the
- * function lives in the chip's ROM and is mapped by the vendor linker script
- * esp32s3.rom.ld (tinfl_decompress_mem_to_mem = 0x4000084c) shipped with the core.
+/* gunzip via mask-ROM miniz (tinfl). This is NOT an external package: the
+ * function lives in ROM and is mapped by the target-specific vendor linker script
+ * (esp32s3.rom.ld / esp32c5.rom.ld) shipped with the core.
  * Zero flash cost; decades-proven public-domain code baked into silicon. */
 #define TINFL_DECOMPRESS_MEM_TO_MEM_FAILED ((size_t)(-1))
 extern "C" size_t tinfl_decompress_mem_to_mem(void *pOut_buf, size_t out_buf_len,
@@ -85,6 +87,7 @@ static volatile uint32_t g_desync = 0;       // times the stream was out of fram
  * count AirDrop events -- who asked, what we answered, which advertised port a sender
  * dialled -- so they belong here, with the code that writes them. */
 static volatile uint32_t g_resp_tx = 0, g_resp_err = 0, g_query_seen = 0;
+static volatile uint32_t g_announce_tx = 0, g_announce_errors = 0;
 static volatile uint32_t g_notus = 0, g_ka_suppress = 0, g_dump_count = 0;
 static volatile uint32_t g_tcp_tous = 0;
 static volatile uint32_t g_syn_airdrop = 0, g_syn_pair1 = 0, g_syn_pair2 = 0, g_syn_other = 0;
@@ -978,7 +981,7 @@ enum { RXM_UNDECIDED = 0,   // fewer than 10 body bytes: no shape yet
 enum { RXF_NONE = 0,
        RXF_OOM,             // this device could not give the memory -> 507
        RXF_CAP,             // the body outgrew what this device can ever hold -> 413
-       RXF_INFLATE };       // a record's zlib would not inflate -> 400
+       RXF_INFLATE, RXF_CONSUMER, RXF_FORMAT };
 
 struct RxPump {
   uint8_t  *out;            // decoded archive, PSRAM; ownership moves at handoff
@@ -986,12 +989,32 @@ struct RxPump {
   uint32_t  in_total;       // body bytes ever appended -- sink->len is only the residue
   uint32_t  residue_prev;   // sink->len as this hook last left it, for the delta
   uint32_t  nrec, nstored;
+  uint32_t  stream_id, stream_crc;
   int       end;            // AdDvzipEnd of the FINAL drain; init to END_RUNNING
   uint8_t   mode;           // RXM_*
   uint8_t   fail;           // RXF_*, sticky
   bool      psram_limited;  // out_cap was capped by free PSRAM, not by any policy:
                             // turns a later CAP into 507 (device) instead of 413 (file)
 };
+
+static bool rx_pump_publish(struct RxPump *p, uint32_t got) {
+  if (g_stream_req) {
+    if (got > g_rx_max - p->out_len) { p->fail = RXF_CAP; return false; }
+    for (uint32_t off = 0; off < got; ) {
+      uint32_t n = got - off; if (n > AD_STREAM_CHUNK_SIZE) n = AD_STREAM_CHUNK_SIZE;
+      if (!stream_send(AD_STREAM_DATA, p->stream_id, p->out_len + off, p->out + off, n, 0)) {
+        AD_LOG("STREAM-CONSUMER-FAIL: id=%lu offset=%lu n=%lu\n", (unsigned long)p->stream_id,
+               (unsigned long)(p->out_len + off), (unsigned long)n);
+        p->fail = RXF_CONSUMER; return false;
+      }
+      off += n;
+    }
+    p->stream_crc = esp_rom_crc32_le(p->stream_crc, p->out, got);
+  }
+  p->out_len += got;
+  if (!g_stream_req) preview_publish(p->out, p->out_len, 1);
+  return true;
+}
 
 /* Decode ONE complete record into the output block. Shared by the in-flight drain
    and the whole-buffer fallback below, so there is exactly one decoder.
@@ -1000,7 +1023,8 @@ struct RxPump {
    were the summary and the cut report -- the two it existed to produce. */
 static bool rx_pump_emit(void *vp, const struct AdDvzipRec *rec, const uint8_t *payload) {
   struct RxPump *p = (struct RxPump *)vp;
-  uint32_t room = p->out_cap - p->out_len;
+  uint32_t room = g_stream_req ? p->out_cap : p->out_cap - p->out_len;
+  uint8_t *dest = p->out + (g_stream_req ? 0 : p->out_len);
   if (rec->stored) {
     /* A STORED RECORD IS A COPY, NOT A DECOMPRESSION. macOS switches to these once
        deflate stops paying on an already-compressed image -- measured, 6 of the 18
@@ -1012,13 +1036,12 @@ static bool rx_pump_emit(void *vp, const struct AdDvzipRec *rec, const uint8_t *
              (unsigned long)(p->nrec + 1), (unsigned long)rec->len, (unsigned long)room);
       return false;
     }
-    memcpy(p->out + p->out_len, payload, rec->len);
-    p->out_len += rec->len; p->nrec++; p->nstored++;
-    preview_publish(p->out, p->out_len, 1);
-    return true;
+    memcpy(dest, payload, rec->len);
+    p->nrec++; p->nstored++;
+    return rx_pump_publish(p, rec->len);
   }
   const uint32_t decode_start = micros();
-  size_t got = tinfl_decompress_mem_to_mem(p->out + p->out_len, room,
+  size_t got = tinfl_decompress_mem_to_mem(dest, room,
                                            payload, rec->len, TINFL_FLAG_PARSE_ZLIB_HEADER);
   const uint32_t elapsed = (uint32_t)(micros() - decode_start);
   g_decode_us.fetch_add(elapsed, std::memory_order_relaxed);
@@ -1034,9 +1057,8 @@ static bool rx_pump_emit(void *vp, const struct AdDvzipRec *rec, const uint8_t *
            p->fail == RXF_CAP ? "cap" : "inflate");
     return false;
   }
-  p->out_len += (uint32_t)got; p->nrec++;
-  preview_publish(p->out, p->out_len, 1);
-  return true;
+  p->nrec++;
+  return rx_pump_publish(p, (uint32_t)got);
 }
 
 /* Adopt streaming only on the DvZip wire signature: a plausible first record length
@@ -1084,8 +1106,9 @@ static bool rx_pump_open(struct RxPump *p) {
   uint32_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
   uint32_t avail = (largest > RX_OUT_HEADROOM) ? largest - RX_OUT_HEADROOM : 0;
   uint32_t want = (g_rx_max < avail) ? g_rx_max : avail;
-  p->psram_limited = avail < g_rx_max;
-  g_rx_max_eff = want;
+  if (g_stream_req) want = 2u * AD_DVZIP_GRAIN;
+  p->psram_limited = !g_stream_req && avail < g_rx_max;
+  g_rx_max_eff = g_stream_req ? g_rx_max : want;
   p->out = want ? (uint8_t *)heap_caps_malloc(want, MALLOC_CAP_SPIRAM) : nullptr;
   if (!p->out) {
     AD_LOG("RX-OOM: decode block of %lu B refused, %lu free / %lu largest in PSRAM\n",
@@ -1119,7 +1142,8 @@ static void rx_sink_progress(struct HttpSink *sk) {
   g_rx_touch_ms = (uint32_t)(esp_timer_get_time() / 1000);
   if (p->mode == RXM_UNDECIDED && !p->fail) {
     p->mode = (uint8_t)rx_body_shape(sk->buf, sk->len);
-    if (p->mode == RXM_STREAM && !rx_pump_open(p)) p->mode = RXM_RAW;  /* fail=RXF_OOM set */
+    if (p->mode == RXM_STREAM && !rx_pump_open(p)) p->mode = RXM_RAW;
+    if (g_stream_req && p->mode == RXM_RAW && !p->fail) p->fail = RXF_FORMAT;
   }
   if (p->mode == RXM_STREAM && !p->fail) {
     /* EVERY BUFFER HERE IS FED BY A REMOTE STRANGER'S DEVICE. The output block bounds
@@ -1127,7 +1151,7 @@ static void rx_sink_progress(struct HttpSink *sk) {
        sees them, so INPUT needs its own bound or a stream of records decoding to nothing
        keeps this sink receiving for ever. Output tracks input to +0.09% measured, so
        input a megabyte past the output ceiling is not a photo. */
-    if (p->in_total > p->out_cap + (1u << 20)) {
+    if (p->in_total > (g_stream_req ? g_rx_max : p->out_cap) + (1u << 20)) {
       p->fail = RXF_CAP;
       AD_LOG("RX-CAP: %lu B in vs %lu B out ceiling -- input bound tripped\n",
              (unsigned long)p->in_total, (unsigned long)p->out_cap);
@@ -1179,7 +1203,7 @@ static bool rx_sink_grow(struct HttpSink *sk, uint32_t need) {
 // Sets g_upload_ok / g_img_* on success, g_img_err on failure.
 static void rx_upload(struct HttpRdr *r, bool chunked, int clen) {
   mbedtls_ssl_context *ssl = (mbedtls_ssl_context *)r->ctx;
-  if (g_arch_ready) {
+  if (g_arch_ready || g_upload_running.exchange(true)) {
     const char busy[] = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     ssl_write_all(ssl, (const unsigned char *)busy, sizeof(busy) - 1);
     return;
@@ -1196,6 +1220,7 @@ static void rx_upload(struct HttpRdr *r, bool chunked, int clen) {
 
   struct RxPump pump;
   memset(&pump, 0, sizeof(pump));
+  pump.stream_id = ++g_stream_next_id;
   pump.end = AD_DVZIP_END_RUNNING;   /* zero is END_RECORD, which claims certainty */
 #ifdef AIRDROP_BODY_KEEP
   pump.mode = RXM_RAW;               /* the probe build keeps the RAW body: decoding
@@ -1223,7 +1248,8 @@ static void rx_upload(struct HttpRdr *r, bool chunked, int clen) {
   if (chunked) {
     struct HttpSink sk;
     memset(&sk, 0, sizeof(sk));
-    sk.buf = gz; sk.cap = cap; sk.len = 0; sk.max = g_rx_max; sk.grow = rx_sink_grow;
+    sk.buf = gz; sk.cap = cap; sk.len = 0;
+    sk.max = g_stream_req ? RX_REC_SANE + 32768u : g_rx_max; sk.grow = rx_sink_grow;
     sk.progress = rx_sink_progress;
     sk.ctx = &pump;                    /* the progress hook decodes through this */
     // 10s while the body is flowing; 3000ms of silence to accept a boundary-aligned
@@ -1252,7 +1278,8 @@ static void rx_upload(struct HttpRdr *r, bool chunked, int clen) {
        rc, (unsigned long)body_total, (unsigned long)len,
        (unsigned long)pump.out_len, r->poisoned, r->eof, r->timed_out);
   } else if (clen > 0) {
-    if ((uint32_t)clen > g_rx_max) overflow = true;
+    if (g_stream_req) { pump.fail = RXF_FORMAT; }
+    else if ((uint32_t)clen > g_rx_max) overflow = true;
     else {
       if ((uint32_t)clen > cap) {
         uint8_t *np = (uint8_t *)heap_caps_realloc(gz, clen, MALLOC_CAP_SPIRAM);
@@ -1281,33 +1308,28 @@ static void rx_upload(struct HttpRdr *r, bool chunked, int clen) {
   // A read timeout is not an HTTP/DvZip delimiter. Never acknowledge or publish
   // a decodable prefix as a successful upload (442329-byte iPhone regression).
   if (!clean_end) receipt_error = r->timed_out ? "upload receive timeout" : "upload body truncated";
+  else if (g_stream_req && pump.mode != RXM_STREAM) receipt_error = "stream requires DvZip";
   else if (pump.mode == RXM_STREAM && !pump.fail) {
     if (!ad_dvzip_end_ok(pump.end)) receipt_error = "dvzip truncated";
-    else if (!ad_cpio_has_complete_files(pump.out, pump.out_len))
+    else if (!g_stream_req && !ad_cpio_has_complete_files(pump.out, pump.out_len))
       receipt_error = "archive truncated or empty";
+    else if (g_stream_req && !stream_send(AD_STREAM_COMMIT, pump.stream_id, pump.out_len,
+                                        nullptr, 0, pump.stream_crc))
+      receipt_error = "consumer did not commit archive";
   }
 
-  {  /* TELL THE SENDER WHETHER WE ACTUALLY GOT IT.
-      *
-      * This used to answer 200 unconditionally, on the rule that "success is about
-      * receipt, not decode". The rule is right and the code did not implement it: an
-      * overflow IS a receipt failure, and we were reporting it as receipt success. The
-      * consequence was visible: the badge said the transfer had failed while the Mac sat on
-      * "Sending" indefinitely, because the only thing we ever told it was 200.
-      *
-      * Decoding in flight moves the rest of the outcomes to this side of the response,
-      * and each names itself. 507 and 413 are different facts -- one is this device
-      * being out of memory right now, the other is a file this device can never take --
-      * and a user can act on the difference. A record whose zlib will not inflate is
-      * 400: with TLS below us those bytes are the bytes the sender produced, and a 200
-      * for an archive we provably cannot reconstruct is the exact lie this redesign
-      * exists to remove. Only failures discovered after this write -- the cpio walk,
-      * the sketch's handler -- still answer 200, because receipt truly did succeed. */
+  {  /* Reply only after complete HTTP/DvZip receipt. Streaming also requires the
+      * consumer's COMMIT (archive validation and storage) above. The buffered S3
+      * path performs its file callbacks later, so its 200 confirms receipt only.
+      * Keep capacity (413), allocation (507), malformed data (400), unsupported
+      * format (415), and consumer failure (502) distinguishable. */
     const char *status = "200 OK";
     /* INFLATE is judged first: aborting a receive mid-body (the sink's max=0 clamp)
        surfaces as OVERFLOW too, and the record that would not inflate is the truer
        fact than the abort it caused. */
-    if (pump.fail == RXF_INFLATE)          status = "400 Bad Request";
+    if (pump.fail == RXF_CONSUMER)         status = "502 Bad Gateway";
+    else if (pump.fail == RXF_FORMAT)      status = "415 Unsupported Media Type";
+    else if (pump.fail == RXF_INFLATE)     status = "400 Bad Request";
     else if (overflow)                     status = g_rx_grow_failed ? "507 Insufficient Storage"
                                                                      : "413 Content Too Large";
     else if (body_total < 6)               status = "400 Bad Request";
@@ -1352,6 +1374,10 @@ static void rx_upload(struct HttpRdr *r, bool chunked, int clen) {
   }
   AD_LOG("UPLOAD: received %lu bytes (chunk=%d ovf=%d complete=%d)\n",
                 (unsigned long)body_total, chunked, overflow, clean_end);
+  if (pump.fail == RXF_CONSUMER || pump.fail == RXF_FORMAT) {
+    strlcpy(g_img_errmsg, pump.fail == RXF_CONSUMER ? "output chunk not acknowledged" : "stream requires chunked DvZip", sizeof(g_img_errmsg));
+    g_img_err++; goto done;
+  }
   if (pump.fail == RXF_INFLATE) {          /* before overflow, same order as the status */
     snprintf(g_img_errmsg, sizeof(g_img_errmsg), "record %lu would not inflate",
              (unsigned long)(pump.nrec + 1));
@@ -1366,6 +1392,13 @@ static void rx_upload(struct HttpRdr *r, bool chunked, int clen) {
   if (receipt_error) {
     strlcpy(g_img_errmsg, receipt_error, sizeof(g_img_errmsg));
     g_img_err++; goto done;
+  }
+
+  if (g_stream_req) {
+    g_files_ok += g_stream_files; g_upload_ok++;
+    AD_LOG("UPLOAD-SAVED: %lu decoded bytes, %lu files on computer\n",
+           (unsigned long)pump.out_len, (unsigned long)g_stream_files);
+    goto done;
   }
 
   if (pump.mode != RXM_STREAM) {
@@ -1565,6 +1598,44 @@ done_norsp:
 // persistent buffered reader spans the whole connection: request bodies (incl.
 // the chunked /Ask metadata) are drained through it, so the next request starts
 // exactly where the last one ended -- no bytes are read-ahead and lost.
+static void stream_test_task(void *) {
+  RxPump p = {}; p.stream_id = ++g_stream_next_id;
+  const uint32_t size = 7u * 1024u * 1024u;
+  uint8_t *data = (uint8_t *)heap_caps_malloc(AD_DVZIP_GRAIN, MALLOC_CAP_SPIRAM);
+  bool ok = data && rx_pump_open(&p);
+  char header[160];
+  const char name[] = "bridge_stream_selftest.bin";
+  int n = snprintf(header, sizeof(header), "070707%06o%06o%06o%06o%06o%06o%06o%011o%06o%011o",
+                   0, 0, 0100644, 0, 0, 1, 0, 0, (unsigned)sizeof(name), (unsigned)size);
+  memcpy(header + n, name, sizeof(name)); n += sizeof(name);
+  AdDvzipRec rec = {}; rec.stored = true; rec.len = (uint32_t)n;
+  if (ok) ok = rx_pump_emit(&p, &rec, (const uint8_t *)header);
+  if (data) for (uint32_t i = 0; i < AD_DVZIP_GRAIN; ++i) data[i] = (uint8_t)i;
+  rec.len = AD_DVZIP_GRAIN;
+  for (uint32_t off = 0; ok && off < size; off += AD_DVZIP_GRAIN) {
+    ok = rx_pump_emit(&p, &rec, data);
+    g_rx_bytes = p.out_len;
+  }
+  if (ok) ok = stream_send(AD_STREAM_COMMIT, p.stream_id, p.out_len, nullptr, 0, p.stream_crc);
+  AD_LOG("STREAMTEST %s: %lu/%lu synthetic bytes, fail=%u, %lu ms; no Wi-Fi measured\n", ok ? "OK" : "FAILED",
+         (unsigned long)p.out_len, (unsigned long)size, (unsigned)p.fail,
+         (unsigned long)(millis() - g_rx_started_ms.load()));
+  if (!ok) { strlcpy(g_img_errmsg, "synthetic stream test failed", sizeof(g_img_errmsg)); g_img_err++; }
+  if (data) heap_caps_free(data);
+  if (p.out) heap_caps_free(p.out);
+  g_rx_active = false; g_rx_elapsed_ms = millis() - g_rx_started_ms.load();
+  g_upload_running = false;
+  vTaskDelete(nullptr);
+}
+bool ad_stream_self_test(void) {
+  if (!g_stream_req || g_rx_active || g_arch_ready || g_upload_running.exchange(true)) return false;
+  g_rx_active = true; g_rx_started_ms = millis(); g_rx_bytes = 0; g_img_errmsg[0] = 0;
+  if (xTaskCreate(stream_test_task, "stream_test", 6144, nullptr, 1, nullptr) != pdPASS) {
+    g_rx_active = false; g_upload_running = false; return false;
+  }
+  return true;
+}
+
 static void sv_upload(struct HttpServe *s, bool chunked, int clen) {
   rx_upload(s->r, chunked, clen);
 }
@@ -1597,6 +1668,9 @@ static void serve_http(mbedtls_ssl_context *ssl) {
   sv.on_ask_sent = sv_on_ask_sent; sv.upload = sv_upload;
   sv.peer_waiting = sv_peer_waiting;
   sv.enter_ms = g_http_enter_ms;
+#if CONFIG_IDF_TARGET_ESP32C5
+  sv.ask_keep_alive = true;
+#endif
   serve_http_run(&sv);
 }
 
@@ -1918,6 +1992,28 @@ void ad_poll(void) {
 static bool g_ad_role_receiver = false;
 bool ad_role_is_receiver(void) { return g_ad_role_receiver; }
 
+#if CONFIG_IDF_TARGET_ESP32C5
+/* A cold phone may never query our fixed channel. Send the same DNS-SD records
+ * directly to recently heard AWDL peers, in a scheduled availability window.
+ * Link multicast is refused by this SDK; directed delivery is already used by
+ * ad_respond(). Separate storage avoids races with that RX-task responder.
+ * One peer per ~2.5 seconds, no announcements during an upload. */
+static void ad_announce_peer(void *) {
+  if (g_rx_active || g_upload_running.load()) return;
+  AdPeerTab peers; awdl_peertab_read(&peers, millis(), 5000);
+  static unsigned cursor = 0;
+  for (unsigned n = 0; n < ADP_ROWS; ++n) {
+    const AdPeerRow &p = peers.row[cursor++ % ADP_ROWS];
+    if (!p.used || memcmp(p.mac, g_id.mac, 6) == 0) continue;
+    static uint8_t frame[AWDL_TX_HEADROOM + 1400];
+    const int len = build_mdns_ip6(frame);
+    if (awdl_tx_ip6_now(p.mac, frame, (size_t)len) == 0) ++g_announce_tx;
+    else ++g_announce_errors;
+    break;
+  }
+}
+#endif
+
 int ad_begin(const char *name, uint32_t max_receive) {
   g_ad_role_receiver = true;
 
@@ -1941,14 +2037,17 @@ int ad_begin(const char *name, uint32_t max_receive) {
      the mDNS records we are about to advertise are built out of it. */
   awdl_identity(&g_id);
   awdl_rx_tap_set(ad_rx_tap, nullptr);
-  /* No announce callback is registered -- there is no periodic multicast announcement, for
-     the reasons set out in the note above ad_respond(). The hook itself stays available. */
+#if CONFIG_IDF_TARGET_ESP32C5
+  awdl_set_announce_cb(ad_announce_peer, nullptr);
+#endif
+  /* S3 keeps passive discovery. C5's directed announcements do not use the
+     multicast address that the raw-frame driver rejects. */
   /* 32 KB: mbedTLS handshake state is on this stack, and CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC
    * means it cannot be moved to PSRAM. Keep below Wi-Fi/lwIP priorities. The S3
    * bridge selects core 0 so inflate/TLS no longer shares core 1's AWDL cadence.
    * Other sketches retain their original placement unless they opt in. */
 #ifndef AD_RECEIVE_CORE
-#define AD_RECEIVE_CORE 1
+#define AD_RECEIVE_CORE (portNUM_PROCESSORS > 1 ? 1 : 0)
 #endif
   return xTaskCreatePinnedToCore(tcp_listen_task, "tcp_listen", 32768, nullptr, 2,
                                  &g_listener_task, AD_RECEIVE_CORE) == pdPASS ? 0 : -1;
@@ -1983,6 +2082,7 @@ void ad_stats_read(struct AdStatus *out) {
   out->ec_crt_err  = g_ec_crt_err;
   out->ec_key_err  = g_ec_key_err;
   out->query_seen  = g_query_seen;
+  out->announce_tx = g_announce_tx; out->announce_errors = g_announce_errors;
   out->resp_tx     = g_resp_tx;
   out->notus       = g_notus;
   out->ka_suppress = g_ka_suppress;

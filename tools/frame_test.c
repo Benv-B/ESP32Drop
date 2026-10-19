@@ -346,6 +346,40 @@ int main(void) {
           !awdl_parse_action(buf, AWDL_ACTION_HDR_LEN - 1, &h), NULL);
   }
 
+  /* Fixed 5 GHz profiles must agree in both channel sequences, sync and DPS. */
+  for (int profile = 0; profile < 2; profile++) {
+    const uint8_t channel = profile ? 149 : 44;
+    const uint8_t opclass = profile ? 124 : 115;
+    struct AwdlMifParams m; fill(&m, &GOLD[0]);
+    m.radio_channel = channel;
+    size_t n = awdl_build_mif(buf, sizeof buf, &m);
+    struct AwdlActionHdr h;
+    check("5 GHz action frame parses", awdl_parse_action(buf, n, &h), NULL);
+    const uint8_t *cur = h.tlv; struct AwdlTlv t;
+    int sequences = 0, sync_ok = 0, dps_ok = 0, ht_ok = 0;
+    while (awdl_tlv_next(&cur, h.tlv_end, &t)) {
+      const uint8_t *seq = NULL;
+      if (t.tag == TLV_SYNC_PARAMS) {
+        sync_ok = t.val[0] == channel && t.val[3] == channel;
+        seq = t.val + 33 + 6;
+      } else if (t.tag == TLV_CHAN_SEQ) seq = t.val + 6;
+      if (seq) {
+        int correct = 1;
+        for (int i = 0; i < 16; i++)
+          if (seq[2*i] != channel || seq[2*i+1] != opclass) correct = 0;
+        sequences += correct;
+      }
+      if (t.tag == TLV_DATA_PATH_STATE) dps_ok = t.val[5] == (profile ? 4 : 2);
+      if (t.tag == TLV_HT_CAPABILITIES) ht_ok = !(t.val[2] & 2);
+    }
+    check("both sequences advertise the selected 20 MHz channel", sequences == 2, NULL);
+    check("sync and social-channel mask match the radio", sync_ok && dps_ok, NULL);
+    check("5 GHz does not advertise 40 MHz HT reception", ht_ok, NULL);
+  }
+  {
+    struct AwdlMifParams m; fill(&m, &GOLD[0]); m.radio_channel = 36;
+    check("unsupported profile is refused", awdl_build_mif(buf, sizeof buf, &m) == 0, NULL);
+  }
   printf("\n%d checks, %d failed\n", ran, fails);
   return fails ? 1 : 0;
 }

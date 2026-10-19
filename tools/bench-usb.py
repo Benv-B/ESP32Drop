@@ -1,4 +1,4 @@
-"""Check 1 MiB from the real S3 USB port. Stop the viewer before running.
+"""Check 1 MiB from the real bridge USB port. Stop the viewer before running.
 
 No files are sent over Wi-Fi. CRC, byte contents and repeated transfers are
 checked independently of the firmware; output is JSON for repeatable measurements.
@@ -40,8 +40,9 @@ def main():
             for frame in decoder.feed(connection.read(max(1, connection.in_waiting))):
                 if frame.kind == STATUS:
                     status = json.loads(frame.payload)
-        if not status or status.get("firmware") not in ("xiao-dual-1", "xiao-dual-2") or status.get("rx_active"):
-            raise RuntimeError(f"Expected idle xiao-dual firmware; got {status}")
+        if (not status or not status.get("ready") or status.get("bridge_protocol") != 1 or
+                status.get("rx_active") or status.get("delivery_pending")):
+            raise RuntimeError(f"Expected idle bridge protocol v1 firmware; got {status}")
         print(json.dumps({"board": status}), flush=True)
         for run in range(1, args.repeat + 1):
             start = time.monotonic()

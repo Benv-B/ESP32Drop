@@ -47,13 +47,11 @@ struct AdStatus {
 
   /* --- discovery: before a sender can connect, it has to find us -------------------
    * The funnel starts here. A query we never answered is a tile that never appeared. */
-  /* There is no "announcements sent" counter, and its absence is the point. AirDrop
-     advertises through the AWDL service TLVs in the action frame; the unsolicited mDNS
-     multicast announcement was removed because the radio will not transmit it and because
-     every record it carried is served by answering a query. A counter that can only ever
-     read zero is worse than no counter. */
+  /* S3 discovery uses service TLVs and query replies. C5 additionally announces
+     directly to recently heard peers; link multicast is still unsupported. */
   uint32_t query_seen;      /* mDNS queries that mentioned us or the service          */
   uint32_t resp_tx;         /* ...of which we answered                                */
+  uint32_t announce_tx, announce_errors; /* C5 directed discovery announcements */
   uint32_t notus;           /* ...asked for nothing we hold (parsed, so not answered) */
   uint32_t ka_suppress;     /* ...already held every record we would have sent        */
   uint32_t dump_count;      /* mDNS payloads captured for offline decode              */

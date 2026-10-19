@@ -60,6 +60,7 @@ typedef struct {
   char     logs[64][192]; int nlog;
   uint32_t disc_ms, ask_ms, disc_ok, ask_ok, desync;
   int      ask_sent, uploads;
+  uint32_t ask_sent_ms;
   uint32_t peer_at_ms;   /* when the upload connection shows up; UINT32_MAX = never.
                             0 means it is ALREADY in the backlog, which is the ordinary
                             case: sharingd opens it the instant it reads our 200. */
@@ -79,7 +80,10 @@ static void hz_log(struct HttpServe *sv, const char *line) {
   if (h->nlog < 64) { snprintf(h->logs[h->nlog], 192, "%s", line); h->nlog++; }
 }
 static void hz_set_timeout(struct HttpRdr *r, uint32_t ms) { r->timeout_ms = ms; }
-static void hz_on_ask_sent(struct HttpServe *sv) { ((Harness *)sv->io)->ask_sent++; }
+static void hz_on_ask_sent(struct HttpServe *sv) {
+  Harness *h = (Harness *)sv->io;
+  h->ask_sent++; h->ask_sent_ms = sv->now(sv);
+}
 /* Stands in for a zero-timeout look at the listening socket. */
 static bool hz_peer_waiting(struct HttpServe *sv) {
   Harness *h = (Harness *)sv->io;
@@ -108,7 +112,8 @@ static void hz_upload(struct HttpServe *sv, bool chunked, int clen) {
   sv->write(sv, (const unsigned char *)ok, (int)strlen(ok));
 }
 
-static void harness_run_peer(Harness *h, Script *s, uint32_t peer_at_ms, bool wire_peer) {
+static void harness_run_options(Harness *h, Script *s, uint32_t peer_at_ms, bool wire_peer,
+                                bool keep_alive) {
   memset(h, 0, sizeof *h); h->s = s; h->peer_at_ms = peer_at_ms;
   struct HttpRdr r; http_rdr_init(&r, s, script_read);
   struct HttpServe sv; memset(&sv, 0, sizeof sv);
@@ -122,7 +127,11 @@ static void harness_run_peer(Harness *h, Script *s, uint32_t peer_at_ms, bool wi
   sv.on_ask_sent = hz_on_ask_sent; sv.upload = hz_upload;
   if (wire_peer) sv.peer_waiting = hz_peer_waiting;
   sv.enter_ms = s->now_ms;
+  sv.ask_keep_alive = keep_alive;
   serve_http_run(&sv);
+}
+static void harness_run_peer(Harness *h, Script *s, uint32_t peer_at_ms, bool wire_peer) {
+  harness_run_options(h, s, peer_at_ms, wire_peer, false);
 }
 static void harness_run(Harness *h, Script *s) { harness_run_peer(h, s, 0, true); }
 
@@ -332,6 +341,44 @@ int main(void) {
           cont && ok && cont < ok, d);
   }
 
+  {
+    const char req[] = "POST /Ask HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+                       "5\r\nWORLD\r\n0\r\n\r\n"
+                       "POST /Upload HTTP/1.1\r\nContent-Length: 3\r\n\r\nABC";
+    Script s = {0}; s.close_at_end = 1; script_add(&s, 0, req, sizeof(req)-1);
+    Harness h; harness_run_options(&h, &s, UINT32_MAX, true, true);
+    check("keep-alive preserves pipelined upload after chunked Ask",
+          h.ask_ok == 1 && h.uploads == 1 && h.upload_drains && !h.desync, NULL);
+    char *ask_body = strstr(h.out, "ASKBODY"), *close_header = strstr(h.out, "Connection: close");
+    check("Ask response permits reuse before Upload closes",
+          ask_body && close_header && ask_body < close_header, NULL);
+  }
+  {
+    const char ask[] = "POST /Ask HTTP/1.1\r\nContent-Length: 5\r\n\r\n";
+    const char upload[] = "POST /Upload HTTP/1.1\r\nContent-Length: 3\r\n\r\nABC";
+    Script s = {0}; s.close_at_end = 1;
+    script_add(&s, 0, ask, sizeof(ask)-1);
+    script_add(&s, 2500, "WORLD", 5);
+    script_add(&s, 6000, upload, sizeof(upload)-1);
+    Harness h; harness_run_options(&h, &s, UINT32_MAX, true, true);
+    check("keep-alive waits across delayed body and delayed upload",
+          h.uploads == 1 && h.upload_drains && !h.desync, NULL);
+    check("Ask is accepted only after the whole request body arrives", h.ask_sent_ms == 2500, NULL);
+  }
+  {
+    const char req[] = "POST /Ask HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nX";
+    Script s = {0}; s.close_at_end = 1; script_add(&s, 0, req, sizeof(req)-1);
+    Harness h; harness_run_options(&h, &s, UINT32_MAX, true, true);
+    check("keep-alive refuses truncated Ask without parsing a next request",
+          !h.uploads && !h.ask_ok && !h.outn && has_log(&h, "ask_body_incomplete"), NULL);
+  }
+  {
+    const char req[] = "POST /Ask HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+    Script s = {0}; script_add(&s, 0, req, sizeof(req)-1);
+    Harness h; harness_run_options(&h, &s, 500, true, true);
+    check("keep-alive yields promptly to a new upload connection",
+          !h.uploads && s.now_ms >= 500 && s.now_ms < 1000, NULL);
+  }
   printf("\n%d checks, %d failed\n", ran, fails);
   return fails ? 1 : 0;
 }

@@ -10,11 +10,16 @@
 基于 [s-iwaki-d/ESP32Drop](https://github.com/s-iwaki-d/ESP32Drop) 的定制版本，保留上游接收实现和许可证。
 发送路径已从本仓库删除。新增 `SerialPhotoBridge` 固件示例与 Windows 本机照片查看器，实现：
 
-**iPhone AirDrop → Seeed XIAO ESP32S3（8 MB Flash / 8 MB PSRAM）→ 原生 USB CDC → 电脑保存原图并显示预览。**
+**iPhone 原生 AirDrop → Seeed XIAO ESP32-C5 / ESP32-S3 → 原生 USB CDC → 电脑保存静态照片。**
 
-接线、编译、烧录、启动查看器和测试说明见 **[中文使用说明](host/README.md)**。
-当前 `xiao-dual-2` 将接收/解包与 USB 分配到两个核心，支持 JPEG / PNG 分段预览。USB 失败后保留 PSRAM 中的归档并重试，电脑校验并写盘后再确认交付；页面分别显示无线接收、USB 转发和保存阶段。
-真实 iPhone 接收链路曾实测通过；本版已完成实板 USB 分段预览、写盘故障补传和确认丢失测试，更新后的 iPhone 连续投送表现仍需实测。Spectra 6 的 SPI 驱动和实际屏幕刷新尚未实现。
+当前优先维护 C5 无线发现与静态照片接收，后续输出可由 SPI 消费者替换；SPI 驱动尚未实现，不开发实况播放或视频功能。
+
+- [中文使用说明](host/README.md)：固定 SDK、CN/149 构建、备份烧录和查看器。
+- [C5 故障记录与回归要求](docs/c5-bugs.md)：无线 ACK、时钟同步、HTTP 边界、输出确认和内存问题。
+- `tools/test-bridge.ps1`：Windows 一键运行桥接相关核心与查看器回归测试。
+
+C5 的 `radio-7` 已连续完整接收两次静态图，清理版保留同一无线策略。使用单个固定信道，不代表已实现 Wi-Fi 6 标称速率或长期稳定性认证。S3 保留双核接收和分段预览路径。
+
 照片、原设备固件备份、日志和本地构建环境不纳入版本控制。
 
 以下说明已按本仓库改过，只描述接收。

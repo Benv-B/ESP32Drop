@@ -1,14 +1,26 @@
 #include <Arduino.h>
 #include <ESP32AWDL.h>
 #include <ESP32Drop.h>
+#include <ESP32DropConfig.h>
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_rom_crc.h"
+#include "esp_wifi.h"
 #include "bridge_app.h"
+#include "bridge_write.h"
 #include "selftest_jpeg.h"
 
 #ifndef PHOTO_BRIDGE_BAUD
 #define PHOTO_BRIDGE_BAUD 921600
+#endif
+#if CONFIG_IDF_TARGET_ESP32C5
+#define PHOTO_BRIDGE_FIRMWARE "xiao-c5-radio-7-cleanup"
+#define PHOTO_BRIDGE_CHIP "ESP32-C5"
+#define PHOTO_BRIDGE_STREAM_ENABLED "true"
+#else
+#define PHOTO_BRIDGE_FIRMWARE "xiao-dual-2-cleanup"
+#define PHOTO_BRIDGE_CHIP "ESP32-S3"
+#define PHOTO_BRIDGE_STREAM_ENABLED "false"
 #endif
 #ifndef PHOTO_BRIDGE_NAME
 #define PHOTO_BRIDGE_NAME "Photo Bridge"
@@ -21,7 +33,11 @@
 static const uint8_t MAGIC[8] = {'E','S','P','D','R','O','P','1'};
 enum { FRAME_LOG = 1, FRAME_FILE = 2, FRAME_STATUS = 3,
        FRAME_ARCHIVE = 4, FRAME_FILE_REF = 5, FRAME_ABORT = 6, FRAME_FILE_DATA = 7 };
+#if CONFIG_IDF_TARGET_ESP32C5
+static const uint32_t RECEIVE_CAP = 128u * 1024u * 1024u;
+#else
 static const uint32_t RECEIVE_CAP = 6u * 1024u * 1024u;
+#endif
 static uint32_t sequence = 0, forwarded = 0;
 static bool ready = false;
 static const char *boot_error = "";
@@ -36,27 +52,20 @@ static void put32(uint8_t *out, uint32_t value) {
   for (int i = 0; i < 4; ++i) out[i] = (uint8_t)(value >> (8 * i));
 }
 
+struct UsbWriter {
+  // HWCDC writes while disconnected can report success after discarding bytes.
+  bool connected() { return (bool)Serial; }
+  int available() { return Serial.availableForWrite(); }
+  size_t write(const uint8_t *data, size_t size) { return Serial.write(data, size); }
+  uint32_t now_ms() { return millis(); }
+  void pause() { delay(1); }
+};
+
 static bool write_all(const uint8_t *data, size_t length) {
-  uint32_t last_progress = millis();
-  uint32_t last_yield = last_progress;
-  while (length) {
-    // HWCDC otherwise reports queued/dropped data as written when disconnected.
-    if (!Serial) return false;
-    // Feed only available FIFO space. Large HWCDC writes can spin waiting for
-    // space; bounded writes let the scheduler run instead. One task owns USB.
-    const int available = Serial.availableForWrite();
-    const size_t chunk = available > 0 ? min(length, (size_t)available) : 0;
-    const size_t sent = chunk ? Serial.write(data, chunk) : 0;
-    if (!Serial) return false;
-    if (sent) { data += sent; length -= sent; usb_bytes += sent; last_progress = millis(); }
-    else if ((uint32_t)(millis() - last_progress) > 3000) { ++usb_stalls; return false; }
-    // Yield under backpressure or after a CPU time budget, rather than at every
-    // 8 KiB boundary. Idle/watchdog still runs during a long legacy file send.
-    if (!sent || (uint32_t)(millis() - last_yield) >= 4) {
-      delay(1); last_yield = millis();
-    }
-  }
-  return true;
+  UsbWriter port;
+  const bool ok = bridge_write_all(port, data, length, usb_bytes);
+  if (!ok) ++usb_stalls;
+  return ok;
 }
 
 static bool send_header(uint8_t kind, uint32_t length, uint32_t crc) {
@@ -102,10 +111,10 @@ static bool forward_live_chunk() {
   return true;
 }
 
-static bool wait_file_ack(uint32_t seq, bool durable) {
+static bool wait_file_ack(uint32_t seq, bool durable, uint32_t *files = nullptr, uint32_t timeout = 0) {
   char line[32]; size_t n = 0;
   const uint32_t start = millis();
-  while ((uint32_t)(millis() - start) < (durable ? 10000u : 2000u)) {
+  while ((uint32_t)(millis() - start) < (timeout ? timeout : (durable ? 10000u : 2000u))) {
     while (Serial.available()) {
       const char c = (char)Serial.read();
       if (c == '\n') {
@@ -113,13 +122,52 @@ static bool wait_file_ack(uint32_t seq, bool durable) {
         unsigned long value = 0;
         if (strcmp(line, "LIVE") == 0) live_host = true;
         if (strcmp(line, "SAVE") == 0) saved_host = true;
-        if (sscanf(line, durable ? "SAVED %lu" : "HAVE %lu", &value) == 1 && value == seq) return true;
+        unsigned long count = 0;
+        if (sscanf(line, durable ? "SAVED %lu %lu" : "HAVE %lu %lu", &value, &count) >= 1 && value == seq) {
+          if (files) *files = (uint32_t)count;
+          return true;
+        }
         if (sscanf(line, "MISS %lu", &value) == 1 && value == seq) return false;
       } else if (c != '\r' && n < sizeof(line) - 1) line[n++] = c;
     }
     delay(1);
   }
   return false;
+}
+
+static bool forward_stream() {
+#if CONFIG_IDF_TARGET_ESP32C5
+  static AdStreamPacket *storage = nullptr;
+  static uint8_t *packet = nullptr;
+  if (!storage) storage = (AdStreamPacket *)heap_caps_malloc(sizeof(AdStreamPacket), MALLOC_CAP_SPIRAM);
+  if (!packet) packet = (uint8_t *)heap_caps_malloc(8 + AD_STREAM_CHUNK_SIZE, MALLOC_CAP_SPIRAM);
+  if (!storage || !packet) return false;
+  AdStreamPacket &part = *storage;
+  if (!ad_stream_read(&part)) return false;
+  put32(packet, part.transfer_id); put32(packet + 4, part.offset);
+  uint32_t size = 8 + part.length;
+  const bool commit = part.kind == AD_STREAM_COMMIT;
+  if (commit) { put32(packet + 8, part.crc); size = 12; }
+  else memcpy(packet + 8, part.data, part.length);
+  bool ok = false; uint32_t files = 0;
+  for (int attempt = 0; attempt < 3 && !ok; ++attempt) {
+    ok = send_header(part.kind, size, esp_rom_crc32_le(0, packet, size)) &&
+      write_all(packet, size) && wait_file_ack(sequence, true, &files, commit ? 15000 : 1000);
+    if (!ok) {
+      ++stream_fallbacks;
+      // HWCDC's SOF-based connection check can dip for an instant while the
+      // COM port stays open. Give its ISR/host time to recover before retrying.
+      delay(100);
+    }
+  }
+  ad_stream_ack(part.token, ok, files);
+  if (ok && !commit) { live_id = part.transfer_id; live_offset = part.offset + part.length; }
+  if (ok && commit) { forwarded += files; streamed_files += files; }
+  live_failed = !ok;
+  return true;
+#else
+  return false;
+#endif
 }
 
 static bool retry_file() {
@@ -209,18 +257,33 @@ static void usb_benchmark() {
 }
 
 static void send_status() {
+  uint8_t radio_primary = 0;
+  wifi_second_chan_t radio_secondary = WIFI_SECOND_CHAN_NONE;
+  char radio_country[3] = {};
+  if (esp_wifi_get_channel(&radio_primary, &radio_secondary) != ESP_OK) radio_primary = 0;
+  if (esp_wifi_get_country_code(radio_country) != ESP_OK) strcpy(radio_country, "??");
+  radio_country[2] = 0;
   struct AdStatus ad = {};
   struct AwdlStatus awdl = {};
   struct AwdlDiag diag = {};
   if (ready) { ad_stats_read(&ad); awdl_status_read(&awdl); awdl_diag_read(&diag, false); }
+  Selection selection = {};
+  AwdlWinState window = {};
+  AwdlGaugeStatus gauge = {};
+  if (ready) {
+    awdl_selection_read(&selection);
+    awdl_winstate_read(&window);
+    awdl_gauge_status_read(&gauge);
+  }
   AdPreview preview = {};
   if (ready) ad_preview_read(live_id, live_offset, nullptr, 0, &preview);
   live_available = preview.available;
   for (char *p = ad.file_errmsg; *p; ++p)
     if ((unsigned char)*p < 32 || *p == '"' || *p == '\\') *p = '?';
-  char json[2800];
+  char json[3400];
   const int length = snprintf(json, sizeof(json),
       "{\"ready\":%s,\"name\":\"Photo Bridge\",\"uptime_ms\":%lu,"
+      "\"bridge_protocol\":1,\"archive_stream_enabled\":" PHOTO_BRIDGE_STREAM_ENABLED ","
       "\"transport\":\"usb_hwcdc\",\"flash_bytes\":%lu,"
       "\"psram_bytes\":%lu,\"psram_free\":%lu,\"internal_free\":%lu,"
       "\"have_master\":%s,\"locked\":%s,\"peers\":%ld,\"mif_sent\":%lu,"
@@ -230,7 +293,7 @@ static void send_status() {
       "\"tls_alg\":\"%s\",\"internal_largest\":%lu,\"resp_tx\":%lu,"
       "\"notus\":%lu,\"ka_suppress\":%lu,\"syn_airdrop\":%lu,\"tcp_tous\":%lu,"
       "\"tx_now_errors\":%lu,\"tx_now_last_err\":%ld,\"mif_tx_errors\":%lu,"
-      "\"firmware\":\"xiao-dual-2\",\"file_error\":\"%s\",\"files_ok\":%lu,"
+      "\"firmware\":\"" PHOTO_BRIDGE_FIRMWARE "\",\"file_error\":\"%s\",\"files_ok\":%lu,"
       "\"ch6_mask\":%u,\"win_state\":%u,\"rssi\":%d,\"ring_drop\":%lu,"
       "\"netif_rx\":%lu,\"netif_tx_sent\":%lu,\"netif_tx_errors\":%lu,"
       "\"txq_drop\":%lu,\"txq_depth_max\":%u,\"tx_done_ok\":%lu,\"tx_done_fail\":%lu,"
@@ -241,7 +304,15 @@ static void send_status() {
       "\"archive_available\":%lu,\"usb_archive_sent\":%lu,\"usb_backlog\":%lu,"
       "\"usb_bytes\":%llu,\"usb_stalls\":%lu,\"ad_log_dropped\":%lu,"
       "\"live_enabled\":%s,\"live_failed\":%s,\"preview_state\":%u,\"transfer_id\":%lu,"
-      "\"save_ack_enabled\":%s,\"delivery_pending\":%s,\"delivery_retries\":%lu}",
+      "\"save_ack_enabled\":%s,\"delivery_pending\":%s,\"delivery_retries\":%lu,"
+      "\"chip\":\"" PHOTO_BRIDGE_CHIP "\",\"cpu_cores\":%u,\"radio_channel\":%u,"
+      "\"radio_actual_channel\":%u,\"radio_country\":\"%s\",\"awdl_rx\":%lu,\"wifi_data_rx\":%lu,\"rx_duplicates\":%lu,"
+      "\"data_retry\":%lu,\"rx_phy_format\":%u,\"rx_phy_rate\":%u,\"tx_call_us_max\":%lu,\"announce_tx\":%lu,\"announce_errors\":%lu,"
+      "\"pll_n\":%lu,\"pll_wander_us\":%.0f,\"pll_residual_us\":%.0f,\"pll_drift_ppm\":%.1f,"
+      "\"gauge_locked\":%d,\"gauge_health\":%d,\"gauge_skipped\":%lu,\"sync_frames\":%lu,"
+      "\"measured_mask\":%u,\"sequence_mask\":%u,\"master_mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\","
+      "\"bssid_filter_enabled\":%u,\"rx_to_us\":%lu,\"rx_to_us_matched\":%lu,\"rx_to_us_retry\":%lu,"
+      "\"rx_match_mask\":%u,\"sync_psf\":%lu,\"sync_mif\":%lu}",
       ready ? "true" : "false", (unsigned long)millis(),
       (unsigned long)ESP.getFlashChipSize(), (unsigned long)ESP.getPsramSize(),
       (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
@@ -275,13 +346,24 @@ static void send_status() {
       live_host ? "true" : "false", live_failed ? "true" : "false",
       (unsigned)preview.state, (unsigned long)preview.transfer_id,
       saved_host ? "true" : "false", ad.delivery_pending ? "true" : "false",
-      (unsigned long)ad.delivery_retries);
+      (unsigned long)ad.delivery_retries, (unsigned)portNUM_PROCESSORS,
+      (unsigned)AWDL_RADIO_CHANNEL, (unsigned)radio_primary, radio_country,
+      (unsigned long)diag.cb_count, (unsigned long)diag.data_any, (unsigned long)diag.netif_rx_duplicates,
+      (unsigned long)diag.data_retry, (unsigned)diag.rx_phy_format, (unsigned)diag.rx_phy_rate,
+      (unsigned long)diag.netif_tx_call_us_max, (unsigned long)ad.announce_tx, (unsigned long)ad.announce_errors,
+      (unsigned long)selection.pll_n, selection.wander, selection.resid_rms, selection.drift_ppm,
+      gauge.locked, gauge.health, (unsigned long)diag.gauge_skip, (unsigned long)diag.sync_frames,
+      (unsigned)window.meas_mask, (unsigned)window.chanseq_mask,
+      selection.addr[0], selection.addr[1], selection.addr[2], selection.addr[3], selection.addr[4], selection.addr[5],
+      (unsigned)AWDL_C5_BSSID_FILTER, (unsigned long)diag.rx_to_us,
+      (unsigned long)diag.rx_to_us_matched, (unsigned long)diag.rx_to_us_retry,
+      (unsigned)diag.rx_match_mask, (unsigned long)diag.sync_psf, (unsigned long)diag.sync_mif);
   if (length > 0 && (size_t)length < sizeof(json)) send_text(FRAME_STATUS, json);
   else send_text(FRAME_LOG, "Status JSON buffer too small");
 }
 
 void bridge_setup() {
-  // XIAO USB-C uses the S3 hardware CDC on GPIO19/20, not UART0 GPIO43/44.
+  // Both XIAO targets use their native USB Serial/JTAG CDC peripheral.
   // Baud is a host API placeholder; native USB throughput is not UART baud-limited.
   Serial.setRxBufferSize(256);
   Serial.setTxBufferSize(8192);
@@ -291,7 +373,7 @@ void bridge_setup() {
   esp_log_level_set("*", ESP_LOG_NONE);  // unframed logs must not corrupt binary photo frames
   delay(300);
   // Do not wait for a PC: AirDrop starts even if the viewer is not open yet.
-  send_text(FRAME_LOG, "SerialPhotoBridge boot; XIAO ESP32S3 native USB CDC");
+  send_text(FRAME_LOG, "SerialPhotoBridge boot; XIAO " PHOTO_BRIDGE_CHIP " native USB CDC");
   if (!psramFound() || ESP.getPsramSize() < 4u * 1024u * 1024u) {
     boot_error = "PSRAM missing or too small";
     send_text(FRAME_LOG, boot_error); send_status(); return;
@@ -302,7 +384,11 @@ void bridge_setup() {
     send_text(FRAME_LOG, esp_err_to_name(link)); send_status(); return;
   }
   ad_on_file(on_file, nullptr);
+#if CONFIG_IDF_TARGET_ESP32C5
+  if (!ad_stream_enable()) { boot_error = "Archive stream allocation failed"; send_status(); return; }
+#else
   if (!ad_preview_enable()) send_text(FRAME_LOG, "Live preview unavailable; using complete files");
+#endif
   if (ad_begin(PHOTO_BRIDGE_NAME, RECEIVE_CAP) != 0) {
     boot_error = "AirDrop listener initialization failed";
     send_text(FRAME_LOG, boot_error); send_status(); return;
@@ -323,6 +409,8 @@ static void read_commands() {
       if (strcmp(command, "LIVE") == 0) live_host = true;
       if (strcmp(command, "SAVE") == 0) saved_host = true;
       if (strcmp(command, "BENCH") == 0) usb_benchmark();
+      if (strcmp(command, "STREAMTEST") == 0)
+        send_text(FRAME_LOG, ad_stream_self_test() ? "Synthetic 7 MiB stream test started; no Wi-Fi measured" : "Stream test unavailable/busy");
       if (strcmp(command, "TEST") == 0) {
         struct AdFile file = {};
         file.name = "bridge_selftest.jpg";
@@ -344,8 +432,10 @@ void bridge_loop() {
   // Losing the USB connection must never downgrade a pending file to fire-and-forget.
   // Negotiate before polling a completed archive or sending another chunk.
   read_commands();
-  bool forwarded_live = false;
+  bool forwarded_live = forward_stream();
+#if !CONFIG_IDF_TARGET_ESP32C5
   for (int i = 0; i < 4 && forward_live_chunk(); ++i) forwarded_live = true;
+#endif
   if (ready) ad_poll();
   char line[200];
   int budget = 8;

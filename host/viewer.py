@@ -26,6 +26,8 @@ from PIL import Image, ImageOps, ImageFile
 
 from protocol import ABORT, ARCHIVE, FILE_REF, FILE_DATA, FILE, LOG, STATUS, Frame, FrameDecoder, unpack_file
 from live import LiveArchive, archive_images
+from protocol import STREAM_DATA, STREAM_COMMIT, file_payload
+from stream import ArchiveStream
 
 try:
     from pillow_heif import register_heif_opener
@@ -118,7 +120,7 @@ class Gallery:
         entry = {"id": ident, "name": name, "size": len(data), "sequence": sequence,
                  "time": datetime.now().isoformat(timespec="seconds"),
                  "preview": preview is not None, "preview_error": preview_error,
-                 "self_test": name == "bridge_selftest.jpg",
+                 "self_test": name in {"bridge_selftest.jpg", "bridge_stream_selftest.bin"},
                  "source": "replay" if self.board.get("transport") == "replay" else "usb"}
         with self.lock:
             self.paths[ident] = (original, preview)
@@ -155,6 +157,7 @@ class SerialReader(threading.Thread):
         self.file_queue: queue.Queue = queue.Queue(maxsize=8)
         self.file_worker = threading.Thread(target=self.process_files, daemon=True)
         self.live_archive = LiveArchive()
+        self.archive_stream = ArchiveStream(gallery.output)
         self.preview_queue: queue.Queue = queue.Queue(maxsize=1)
         self.preview_worker = threading.Thread(target=self.process_previews, daemon=True)
         self.last_preview = 0.0
@@ -166,11 +169,12 @@ class SerialReader(threading.Thread):
         self.deliveries = OrderedDict()
         self.delivery_epoch = 0
 
-    def answer(self, word: str, sequence: int, epoch: int | None = None):
+    def answer(self, word: str, sequence: int, epoch: int | None = None, files: int | None = None):
         try:
             with self.write_lock:
                 if self.connection is not None and (epoch is None or epoch == self.delivery_epoch):
-                    self.connection.write(f"{word} {sequence}\n".encode("ascii"))
+                    suffix = f" {files}" if files is not None else ""
+                    self.connection.write(f"{word} {sequence}{suffix}\n".encode("ascii"))
         except (serial.SerialException, OSError) as exc:
             self.gallery.log(f"USB acknowledgement unavailable; receiver can retry: {exc}")
 
@@ -218,6 +222,28 @@ class SerialReader(threading.Thread):
         except (ValueError, queue.Full) as exc:
             self.answer("MISS", frame.sequence)
             self.gallery.log(f"File delivery not accepted; retry needed: {exc}")
+
+    def handle_stream_frame(self, frame: Frame):
+        try:
+            count = 0
+            if frame.kind == STREAM_DATA:
+                if len(frame.payload) >= 8 and struct.unpack_from("<I", frame.payload)[0] != self.archive_stream.ident:
+                    self.live_started = time.monotonic()
+                    self.gallery.clear_live("receiving")
+                self.archive_stream.append(frame.payload)
+                with self.gallery.lock:
+                    self.gallery.live = {"state": "receiving", "revision": self.archive_stream.length,
+                                         "archive_bytes": self.archive_stream.length, "streaming": True,
+                                         "bytes_per_s": self.archive_stream.length / max(0.001, time.monotonic() - self.live_started)}
+            else:
+                count = self.archive_stream.commit(frame.payload,
+                    lambda name, data: self.gallery.save(frame.sequence, file_payload(name, data)))
+                self.gallery.clear_live("saved")
+                self.gallery.log(f"Archive committed: {self.archive_stream.length:,} bytes, {count} files, CRC32 OK")
+            self.answer("SAVED", frame.sequence, files=count)
+        except (ValueError, OSError) as exc:
+            self.answer("MISS", frame.sequence)
+            self.gallery.log(f"Archive stream rejected: {exc}")
 
     def process_previews(self):
         while not self.stop_event.is_set():
@@ -369,11 +395,15 @@ class SerialReader(threading.Thread):
         uptime = status.get("uptime_ms", 0)
         if self.last_uptime is not None and uptime < self.last_uptime:
             self.live_archive.reset()
+            self.archive_stream.reset()
             self.last_reference = self.last_reference_key = None
             self.gallery.clear_live("idle")
             with self.write_lock:
                 self.delivery_epoch += 1
         self.last_uptime = uptime
+        if not status.get("rx_active") and status.get("file_error") and self.archive_stream.file:
+            self.archive_stream.reset()
+            self.gallery.clear_live("aborted")
         # HWCDC can briefly report disconnected without the COM port closing.
         # Firmware then clears LIVE. Renew on every status, not only at boot;
         # LIVE is idempotent and must never rewind an archive already in flight.
@@ -418,7 +448,9 @@ class SerialReader(threading.Thread):
                     if data:
                         last_data = time.monotonic()
                         for frame in decoder.feed(data):
-                            if frame.kind in (ARCHIVE, FILE_REF, ABORT):
+                            if frame.kind in (STREAM_DATA, STREAM_COMMIT):
+                                self.handle_stream_frame(frame)
+                            elif frame.kind in (ARCHIVE, FILE_REF, ABORT):
                                 self.handle_live_frame(frame)
                             elif frame.kind in (FILE, FILE_DATA):
                                 self.handle_file_frame(frame)

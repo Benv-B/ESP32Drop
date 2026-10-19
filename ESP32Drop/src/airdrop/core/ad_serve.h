@@ -61,6 +61,7 @@ struct HttpServe {
   http_upload_fn upload;         // the /Upload body pipeline (firmware: rx_upload)
 
   uint32_t enter_ms;             // when the HTTP phase began (for http_idle_end)
+  bool ask_keep_alive;           // opt-in: frame /Ask body, then allow /Upload on this TLS stream
 };
 
 static void http_send_response(struct HttpServe *sv, const char *status,
@@ -213,6 +214,39 @@ static void serve_http_run(struct HttpServe *sv) {
     }
 
     if (is_ask) {
+      if (sv->ask_keep_alive) {
+        // C5/5 GHz experiment: the sender may reuse this TLS connection. Never
+        // discard an unframed stream here: it could already contain /Upload.
+        // Read the complete request before accepting it. An early final response
+        // can make the sender cancel its still-running request-body upload.
+#ifndef AD_G2_READ_BODIES
+        const uint32_t body_start = r->consumed;
+        sv->set_timeout(r, 10000);
+        if (!http_drain_body(r, chunked, clen) || r->poisoned) {
+          SV_LOG(sv, "ask_body_incomplete bytes=%lu eof=%d timeout=%d",
+                 (unsigned long)(r->consumed - body_start), r->eof, r->timed_out);
+          break;
+        }
+#endif
+        SV_LOG(sv, "ask_body_complete; accepting request");
+        http_send_response(sv, "200 OK", sv->ask_body, sv->ask_len, false);
+        *sv->ask_ms = sv->now(sv);
+        (*sv->ask_ok)++;
+        if (sv->on_ask_sent) sv->on_ask_sent(sv);
+        SV_LOG(sv, "ask_ok ms_since_req=%lu conn=keep-alive",
+               (unsigned long)(sv->now(sv) - t_req));
+        // At a known request boundary, short fills are safe: no bytes are
+        // consumed. A fresh connection can take over without a 10 s stall.
+        const uint32_t wait_start = sv->now(sv);
+        sv->set_timeout(r, 300);
+        while (r->p == r->n && !r->eof &&
+               (uint32_t)(sv->now(sv) - wait_start) < 10000) {
+          if (sv->peer_waiting && sv->peer_waiting(sv)) break;
+          if (hr_fill(r) > 0) break;
+        }
+        if (r->p == r->n) break;
+        continue;
+      }
       // /Ask's request body is ~129 KB and we discard every byte of it.
       //
       // ⚠️ CORRECTED. This comment used to say, as though measured, that the

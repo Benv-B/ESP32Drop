@@ -54,6 +54,25 @@ bool ad_preview_enable(void);
 void ad_preview_read(uint32_t transfer_id, uint32_t offset, uint8_t *dst,
                      uint32_t capacity, struct AdPreview *out);
 
+/* Optional bounded archive relay. Enable before ad_begin(), instead of preview.
+ * The receive task decodes one record and waits for the consumer's ACK; it never
+ * invokes application code. Poll on the application task; USB and SPI consumers
+ * use the same DATA/COMMIT contract. Kind values also match host/protocol.py.
+ * COMMIT may be acknowledged only after validating cpio and saving all originals.
+ * Timeout/disconnect fails the upload before its HTTP success response. */
+enum { AD_STREAM_DATA = 8, AD_STREAM_COMMIT = 9, AD_STREAM_CHUNK_SIZE = 8192 };
+struct AdStreamPacket {
+  uint32_t token, transfer_id, offset, length, crc;
+  uint8_t kind;
+  uint8_t data[AD_STREAM_CHUNK_SIZE];
+};
+bool ad_stream_enable(void);
+bool ad_stream_read(struct AdStreamPacket *out);
+void ad_stream_ack(uint32_t token, bool accepted, uint32_t files);
+/* Explicit diagnostic: 7 MiB synthetic archive through the real pump/consumer queues.
+ * No radio transfer is measured. Refuses while an upload/delivery is pending. */
+bool ad_stream_self_test(void);
+
 /* Return false if you could not use the file. That is counted and reported through
    AdStatus.file_err / file_errmsg, so a badge that receives a format it cannot draw says
    so in its diagnostics instead of dropping the transfer silently. */
@@ -83,7 +102,9 @@ void ad_file_retry_later(void);
 /* `max_receive` bounds the DECODED archive this device will accept, in bytes, and with it
  * the PSRAM the library takes while a transfer is running. Pass 0 for the library's own
  * default of 6 MiB (RX_MAX_AUTO in ad_port_esp32.cpp). PSRAM only ever lowers that ceiling,
- * never raises it.
+ * never raises it in the default buffered mode. With ad_stream_enable(), only a
+ * 256 KiB record is retained and max_receive bounds total decoded stream bytes;
+ * the consumer is responsible for validation and durable storage before COMMIT.
  *
  * WHY IT IS YOURS TO SET. Decoding happens while the body arrives, so the library holds
  * one block about the size of the finished archive for the length of a transfer. Left to

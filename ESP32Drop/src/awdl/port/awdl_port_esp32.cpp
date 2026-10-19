@@ -49,10 +49,12 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "soc/soc_caps.h"
 #include "lwip/sockets.h"
 
 #include "awdl_port_esp32.h"
 #include "../core/awdl_ring.h"
+#include "../core/awdl_dedup.h"
 #include "../core/awdl_window.h"
 #include "../core/awdl_peer.h"
 #include "../core/awdl_src.h"
@@ -63,6 +65,11 @@
 #include "../core/awdl_diag.h"
 #include "../core/awdl_tick.h"
 #include "../core/awdl_status.h"
+#if AWDL_RADIO_CHANNEL > 14 && !SOC_WIFI_SUPPORT_5G
+#error "5 GHz AWDL requires a 5 GHz radio (ESP32-C5)"
+#endif
+// Single-core chips have no core 1. Keep the S3 task placement unchanged.
+static const BaseType_t AWDL_TASK_CORE = portNUM_PROCESSORS > 1 ? 1 : 0;
 #include "../core/awdl_lru.h"
 #ifndef AWDL_TRANSFER_TRACE
 #define AWDL_TRANSFER_TRACE 0
@@ -547,7 +554,13 @@ static const float SRCHIST_THRESH = 0.35f;  // ch6 above 35% of (peak - backgrou
 // Lock-free SPSC ring: WiFi callback (core0, producer) -> proc task (core1)
 // (RawFrame / RING_SLOTS / SNAP_LEN defined in awdl_sync.h)
 // ============================================================================
+#if CONFIG_IDF_TARGET_ESP32C5
+// Wi-Fi invokes sniffer_cb in task context. Payload copies may live in PSRAM;
+// keep the cursors/control structures internal. C5 has less SRAM than S3.
+static RawFrame *g_ring = nullptr;
+#else
 static RawFrame g_ring[RING_SLOTS];
+#endif
 static struct AwdlRing g_ring_cur;     // cursors + drop count (awdl_ring.h)
 static_assert(AWDL_RING_POW2(RING_SLOTS), "RING_SLOTS must be a power of two");
 
@@ -568,6 +581,21 @@ static void sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
   if (is_data) { g_diag.data_any++; is_awdl = (memcmp(&pl[16], AWDL_BSSID, 6) == 0); }
   else if (fc == 0xd0) is_awdl = (memcmp(&pl[24], APPLE_VENDOR, 4) == 0);
   if (!is_awdl) return;
+  if (is_data) {
+    if (pl[1] & 8) ++g_diag.data_retry;
+#if CONFIG_IDF_TARGET_ESP32C5
+    g_diag.rx_phy_format = pkt->rx_ctrl.cur_bb_format;
+    g_diag.rx_phy_rate = pkt->rx_ctrl.rate;
+    if (memcmp(pl + 4, g_awdl_mac, 6) == 0) {
+      const uint8_t matched = pkt->rx_ctrl.rxmatch0 | (pkt->rx_ctrl.rxmatch1 << 1)
+          | (pkt->rx_ctrl.rxmatch2 << 2) | (pkt->rx_ctrl.rxmatch3 << 3);
+      ++g_diag.rx_to_us;
+      if (matched) ++g_diag.rx_to_us_matched;
+      if (pl[1] & 8) ++g_diag.rx_to_us_retry;
+      g_diag.rx_match_mask = matched;
+    }
+#endif
+  }
 
   // Drop rather than wait when the consumer is behind: this is the WiFi task, and
   // blocking here costs the transmit window. awdl_ring counts what was dropped.
@@ -605,6 +633,10 @@ static struct AwdlPeer *master_row(const uint8_t *addr) {
 // the master address that a hand-rolled TLV walk here would not have. See awdl_parse_sync.
 static void handle_sync(const struct AwdlActionHdr *h, const struct AwdlSyncParams *sy,
                         uint32_t rx_ts) {
+#if CONFIG_IDF_TARGET_ESP32C5
+  // Our transmitted MIF is not an independent clock measurement.
+  if (memcmp(h->src, g_awdl_mac, 6) == 0) return;
+#endif
   uint32_t phy_tx = h->phy_tx;
   uint32_t tgt_tx = h->tgt_tx;
   const uint8_t *master = sy->master;
@@ -651,11 +683,11 @@ static void handle_sync(const struct AwdlActionHdr *h, const struct AwdlSyncPara
   const uint16_t aw_seq_raw = sy->aw_seq;
 
   // 0 = PSF (periodic sync frame), 3 = MIF (master indication frame), -1 = neither.
-  // Only PSF reaches the PLL: everything else returns below, before the accumulation,
-  // which is also why a per-subtype breakdown of the innovation is structurally
-  // unreachable from here.
+  // C5 uses PSF and MIF timing; S3 retains PSF-only acquisition below.
   const int si = (h->subtype == AWDL_SUBTYPE_PSF) ? 0
                : ((h->subtype == AWDL_SUBTYPE_MIF) ? 1 : -1);
+  if (si == 0) ++g_diag.sync_psf;
+  if (si == 1) ++g_diag.sync_mif;
 
   uint32_t nowms = millis();
   taskENTER_CRITICAL(&g_mux);
@@ -703,9 +735,16 @@ static void handle_sync(const struct AwdlActionHdr *h, const struct AwdlSyncPara
   // fresh for the ESRC/MSTR lines.
   sp->last_ms = nowms;
 
-  // Only PSFs drive the gauge. There is no PSF-vs-MIF offset to correct for: measured
-  // across the two subtypes, the bias is -9us.
-  if (si != 0) { taskEXIT_CRITICAL(&g_mux); g_diag.sync_frames++; return; }
+  // On C5/5 GHz, quiet discovery can consist almost entirely of MIFs. Ignoring
+  // their sync parameters starves the clock until the phone starts a transfer.
+  // Both carry the same parsed sync parameters; the gauge still validates each
+  // sample. Preserve the S3's existing PSF-only acquisition.
+#if CONFIG_IDF_TARGET_ESP32C5
+  const bool timing_sample = (si == 0 || si == 1);
+#else
+  const bool timing_sample = (si == 0);
+#endif
+  if (!timing_sample) { taskEXIT_CRITICAL(&g_mux); g_diag.sync_frames++; return; }
 
   uint32_t gph = ga_on_frame(&g_gauge, src, rx_ts, phy_tx, aw_seq_raw);
   if (gph == GA_NONE) {                 // gauge not locked, stale, or this sender
@@ -908,6 +947,7 @@ int awdl_netif_index(void) {
 }
 
 
+static AwdlDedup g_rx_dedup;
 static void handle_data(const uint8_t *pl, uint16_t len) {
   if (!(pl[4] & 0x01)) g_diag.data_ucast++;   // unicast dst = a real point-to-point transfer on ch6
   if (memcmp(&pl[4], g_awdl_mac, 6) == 0) g_diag.to_us++;
@@ -933,6 +973,14 @@ static void handle_data(const uint8_t *pl, uint16_t len) {
   // for_us, sol_node or all_nodes -- so computed inside that branch it would be invisible
   // to exactly the traffic the tap exists for.
   const int iplen = (int)len - (int)(ip - pl);
+  const uint8_t tid = (pl[0] & 0x80) ? (pl[24] & 15) : 16;
+  const uint32_t declared_len = 40u + ((uint32_t)ip[4] << 8) + ip[5];
+  const uint32_t sig = awdl_payload_signature(ip, declared_len <= (uint32_t)iplen ? declared_len : (uint32_t)iplen);
+  const uint32_t now_ms = millis();
+  if (awdl_dedup_seen(&g_rx_dedup, pl, tid, sig, now_ms)) {
+    g_diag.netif_rx_duplicates++;
+    return;
+  }
   // R = received by the ESP frame task, before netif delivery and the AirDrop tap.
   trace_ip('R', pl + 10, ip, (size_t)iplen, 0);
   {
@@ -941,13 +989,8 @@ static void handle_data(const uint8_t *pl, uint16_t len) {
                       pl[7]==g_awdl_mac[3] && pl[8]==g_awdl_mac[4] && pl[9]==g_awdl_mac[5]);
     bool all_nodes = (pl[4]==0x33 && pl[5]==0x33 && pl[6]==0 && pl[7]==0 &&
                       pl[8]==0 && pl[9]==0x01);   // ff02::1
-    // Feed EVERY for_us/multicast frame to lwIP -- do NOT drop 802.11 L2-retransmit
-    // duplicates (Retry bit). Dropping them looks free and is not: if we miss a
-    // frame's ORIGINAL transmission (busy TXing) and hear only its L2 retransmit,
-    // dropping that means lwIP never sees the data at all -- e.g. a ClientHello
-    // arrives only as a retransmit, gets dropped, and select() never marks the socket
-    // readable (observed: rdbl=0 with ClientHellos present). lwIP's TCP de-dups by
-    // sequence number correctly, so passing duplicates is safe.
+    // A Retry bit alone never discards data. The bounded cache above suppresses
+    // only a retry matching bytes we already submitted successfully to lwIP.
     if (for_us) {
       // Seed ND6 with this peer (deterministic fe80<->MAC) BEFORE lwIP replies,
       // so it never enters unresolvable-neighbor NDP churn.
@@ -970,6 +1013,7 @@ static void handle_data(const uint8_t *pl, uint16_t len) {
           rxb[12] = 0x86; rxb[13] = 0xdd;
           memcpy(rxb + 14, ip, iplen);
           esp_err_t rxerr = esp_netif_receive(g_awdl_netif, rxb, 14 + iplen, rxb);
+          if (rxerr == ESP_OK) awdl_dedup_remember(&g_rx_dedup, pl, tid, sig, now_ms);
           // I = netif submission result, not proof that TCP accepted the segment.
           trace_ip('I', pl + 10, ip, (size_t)iplen, rxerr);
           g_diag.netif_rx++;
@@ -1362,7 +1406,13 @@ static Selection awdl_elect_and_publish() {
     // stays shut for the entire life of the boot, and it builds clean and passes all
     // thirteen host suites while the badge transmits nothing at all.
     nw.phase = phase; nw.freq = freq; nw.tlast = tlast;
+#if CONFIG_IDF_TARGET_ESP32C5
+    // A channel sequence by itself supplies no time origin. Never project the
+    // zero-initialized PLL and claim it is a synchronized transmit window.
+    nw.have_lock = pn > 0;
+#else
     nw.have_lock = true;
+#endif
     nw.meas_mask = mask_meas; nw.chanseq_mask = mask_chanseq;   // published together
     if (mask_chanseq) { nw.ch6_mask = mask_chanseq; nw.ch6_slot = (int8_t)ch6_slot_of(addr[chosen]); }
     else                { nw.ch6_mask = mask_meas;    nw.ch6_slot = (int8_t)mpk; }
@@ -1469,6 +1519,7 @@ static size_t build_mif(uint8_t *b, const uint8_t *src, const uint8_t *master,
   m.phase_us       = (uint32_t)s.mean;     // s.mean is wrapped into [0, AWC_US) and
                                            // AWC_US < 2^24, so float -> uint32 is exact
   m.cur_aw_seq     = s.cur_aw_seq;
+  m.radio_channel  = PROBE_CHANNEL;
   return awdl_build_mif(b, AWDL_MIF_MAX, &m);
 }
 
@@ -1646,6 +1697,10 @@ static_assert(AWDL_NETIF_MTU >= 1280, "IPv6 requires a link MTU of at least 1280
  * DRAM, most of it unreachable. */
 struct NetifTxFrame { uint16_t len; uint8_t buf[AWDL_NETIF_MTU + AWDL_TX_HEADROOM]; };
 static QueueHandle_t g_netif_txq = nullptr;
+#if CONFIG_IDF_TARGET_ESP32C5
+static StaticQueue_t g_netif_txq_control;
+static uint8_t *g_netif_txq_storage = nullptr;
+#endif
 
 /* Raw AWDL data is neither associated STA traffic nor ordinary SoftAP traffic. The ESP
  * driver accepts it, but its completion callback reports frequent unicast failures and
@@ -1908,7 +1963,10 @@ static void awdl_netif_flush_tx(int budget, int64_t deadline_us) {
        it is how a transmit path that never works keeps a counter that says it does.
        netif_tx_sent counts what the driver ACCEPTED;
        netif_tx_err counts what it refused, with the last reason. */
+    const int64_t tx_start_us = esp_timer_get_time();
     esp_err_t te = esp_wifi_80211_tx(WIFI_IF_AP, tf.buf, tf.len, true);
+    const uint32_t tx_call_us = (uint32_t)(esp_timer_get_time() - tx_start_us);
+    if (tx_call_us > g_diag.netif_tx_call_us_max) g_diag.netif_tx_call_us_max = tx_call_us;
     if (te == ESP_OK) g_diag.netif_tx_sent++;
     else {
       netif_inflight_done(seq);          // refused injections receive no completion callback
@@ -1963,9 +2021,15 @@ static esp_err_t awdl_netif_post_attach(esp_netif_t *netif, void *h) {
 }
 
 static esp_err_t awdl_netif_init(void) {
+#if CONFIG_IDF_TARGET_ESP32C5
+  g_netif_txq = xQueueCreateStatic(16, sizeof(NetifTxFrame), g_netif_txq_storage,
+                                  &g_netif_txq_control);
+#else
   g_netif_txq = xQueueCreate(16, sizeof(NetifTxFrame));  // 16 x (MTU+headroom); holds a full TLS
                                                          // ServerHello flight burst between
                                                          // ch6 windows without dropping frames
+#endif
+  if (!g_netif_txq) return ESP_ERR_NO_MEM;
   /* A failed-frame copy is cold diagnostic/recovery storage, not timing-critical working
      memory. Prefer PSRAM so the extra reliability does not take another frame-sized bite
      out of the contiguous internal arena mbedTLS needs; fall back for ESP32 boards with
@@ -2075,6 +2139,14 @@ static void ignore_state(esp_err_t e) {
  * defensible choice for a project's own firmware -- fail loudly on a bench -- and an
  * indefensible one in a library, where the boot being ended belongs to someone else's
  * product. All eleven return, and awdl_begin() reports the first failure. */
+#if CONFIG_IDF_TARGET_ESP32C5 && AWDL_C5_BSSID_FILTER
+// Private ABI verified in the pinned C5 libpp.a: (hardware interface index,
+// six-byte address), AP index 1. Only changes the receive BSSID comparator;
+// our own interface MAC and the advertised AWDL identity stay device-specific.
+// Required for C5's measured hardware ACK fix. Do not carry this private ABI to
+// another SDK or chip without checking it again. See docs/c5-bugs.md.
+extern "C" void ic_set_bssid(uint32_t interface_index, const uint8_t *bssid);
+#endif
 static esp_err_t wifi_probe_init(void) {
   esp_err_t e;
   ignore_state(nvs_flash_init());
@@ -2083,6 +2155,10 @@ static esp_err_t wifi_probe_init(void) {
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   if ((e = esp_wifi_init(&cfg))                    != ESP_OK) return e;
   if ((e = esp_wifi_set_storage(WIFI_STORAGE_RAM)) != ESP_OK) return e;
+#if CONFIG_IDF_TARGET_ESP32C5
+  const char country[] = {AWDL_COUNTRY_0, AWDL_COUNTRY_1, 0};
+  if ((e = esp_wifi_set_country_code(country, false)) != ESP_OK) return e;
+#endif
   if ((e = esp_wifi_set_mode(WIFI_MODE_AP))        != ESP_OK) return e;
   /* The interface MAC and the addr1/addr2 used by AWDL MUST be the same address.
    * Merely deriving a locally-administered g_awdl_mac while leaving the radio at its
@@ -2096,10 +2172,21 @@ static esp_err_t wifi_probe_init(void) {
   if ((e = esp_wifi_set_mac(WIFI_IF_AP, g_awdl_mac)) != ESP_OK) return e;
   wifi_config_t ap = {};
   strcpy((char *)ap.ap.ssid, "esp32drop-probe");   /* the library is ESP32Drop now */
-  ap.ap.channel = PROBE_CHANNEL; ap.ap.authmode = WIFI_AUTH_OPEN;
+  // Start on 2.4 GHz, then explicitly select the band after wifi_start(), as
+  // required by esp_wifi_set_band_mode(). No client associates to this AP.
+  ap.ap.channel = 6; ap.ap.authmode = WIFI_AUTH_OPEN;
   ap.ap.ssid_hidden = 1; ap.ap.max_connection = 0; ap.ap.beacon_interval = 60000;
   if ((e = esp_wifi_set_config(WIFI_IF_AP, &ap))   != ESP_OK) return e;
   if ((e = esp_wifi_start())                       != ESP_OK) return e;
+#if SOC_WIFI_SUPPORT_5G
+  if ((e = esp_wifi_set_band_mode(PROBE_CHANNEL > 14 ? WIFI_BAND_MODE_5G_ONLY
+                                                    : WIFI_BAND_MODE_2G_ONLY)) != ESP_OK) return e;
+#endif
+#if AWDL_RADIO_CHANNEL > 14
+  if ((e = esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20)) != ESP_OK) return e;
+  // Legacy OFDM is usable by AWDL action frames; CCK 1 Mbps is not a 5 GHz rate.
+  if ((e = esp_wifi_config_80211_tx_rate(WIFI_IF_AP, WIFI_PHY_RATE_6M)) != ESP_OK) return e;
+#endif
   if ((e = esp_wifi_register_80211_tx_cb(raw_tx_done_cb)) != ESP_OK) return e;
   if ((e = esp_wifi_set_ps(WIFI_PS_NONE))          != ESP_OK) return e;
   wifi_promiscuous_filter_t filt = {
@@ -2109,6 +2196,9 @@ static esp_err_t wifi_probe_init(void) {
   if ((e = esp_wifi_set_promiscuous_rx_cb(sniffer_cb)) != ESP_OK) return e;
   if ((e = esp_wifi_set_promiscuous(true))         != ESP_OK) return e;
   if ((e = esp_wifi_set_channel(PROBE_CHANNEL, WIFI_SECOND_CHAN_NONE)) != ESP_OK) return e;
+#if CONFIG_IDF_TARGET_ESP32C5 && AWDL_C5_BSSID_FILTER
+  ic_set_bssid(1, AWDL_BSSID);
+#endif
   return ESP_OK;
 }
 // Compose the public status. Everything here comes from ONE acquisition of the published
@@ -2412,6 +2502,20 @@ uint32_t awdl_cadence_stack_free_words(void) {
 esp_err_t awdl_begin(void) {
   esp_err_t e;
 
+#if CONFIG_IDF_TARGET_ESP32C5
+  // Allocate before enabling callbacks or workers, so OOM cannot expose null storage.
+  if (!g_ring) g_ring = (RawFrame *)heap_caps_malloc(sizeof(RawFrame) * RING_SLOTS,
+                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!g_netif_txq_storage)
+    g_netif_txq_storage = (uint8_t *)heap_caps_malloc(16 * sizeof(NetifTxFrame),
+                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!g_ring || !g_netif_txq_storage) {
+    free(g_ring); g_ring = nullptr;
+    free(g_netif_txq_storage); g_netif_txq_storage = nullptr;
+    return ESP_ERR_NO_MEM;
+  }
+#endif
+
   awdl_ring_init(&g_ring_cur, RING_SLOTS);
   awdl_winstate_init(&g_win);
   g_sel_pub.idx = -1;
@@ -2446,7 +2550,7 @@ esp_err_t awdl_begin(void) {
   awdl_ll_of_mac(g_awdl_mac, g_ll);
 
   /* Frame path on core 1 at priority 3; the WiFi RX callback stays undisturbed on core 0. */
-  if (xTaskCreatePinnedToCore(proc_task, "awdl_proc", 8192, nullptr, 3, nullptr, 1) != pdPASS)
+  if (xTaskCreatePinnedToCore(proc_task, "awdl_proc", 8192, nullptr, 3, nullptr, AWDL_TASK_CORE) != pdPASS)
     return ESP_ERR_NO_MEM;
 
 #if AWDL_CADENCE_TASK
@@ -2454,7 +2558,7 @@ esp_err_t awdl_begin(void) {
    * yields immediately, so the first cadence pass runs before this function returns --
    * which closes the window in which the published state is still its zeroed self. */
   if (xTaskCreatePinnedToCore(awdl_cadence_task_fn, "awdl_cad", 8192, nullptr, 2,
-                              &g_cadence_task, 1) != pdPASS)
+                              &g_cadence_task, AWDL_TASK_CORE) != pdPASS)
     return ESP_ERR_NO_MEM;
 #endif
 
@@ -2525,6 +2629,10 @@ esp_err_t awdl_end(void) {
   esp_netif_destroy(g_awdl_netif);
   g_awdl_netif = nullptr;
   if (g_netif_txq) { vQueueDelete(g_netif_txq); g_netif_txq = nullptr; }
+#if CONFIG_IDF_TARGET_ESP32C5
+  free(g_netif_txq_storage); g_netif_txq_storage = nullptr;
+  free(g_ring); g_ring = nullptr;
+#endif
   if (g_retry_frame) { free(g_retry_frame); g_retry_frame = nullptr; }
 
   /* 4. State a later begin() must not inherit. The rings, the window and the tick are

@@ -13,6 +13,7 @@
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
+#include "../../ESP32DropConfig.h"
 
 /* ---- timing -----------------------------------------------------------------
  * One AW is 16 TU; one availability-window cycle (AWC) is 64 AW. The chanseq
@@ -33,7 +34,7 @@ static const int64_t AWC_US     = AW_US * AW_PER_AWC;    /* 1048576 us (one cycl
 /* ---- 802.11 / AWDL wire constants ------------------------------------------- */
 static const uint8_t AWDL_BSSID[6]   = {0x00, 0x25, 0x00, 0xff, 0x94, 0x73};
 static const uint8_t APPLE_VENDOR[4] = {0x7f, 0x00, 0x17, 0xf2};
-static const uint8_t PROBE_CHANNEL   = 6;
+static const uint8_t PROBE_CHANNEL   = AWDL_RADIO_CHANNEL;
 
 /* ---- action-frame TLV tags --------------------------------------------------- */
 enum {

@@ -25,10 +25,11 @@ function renderLive(l,b,files){
  let text=labels[l.state]||'等待图片数据';
  if(b.rx_active&&l.state!=='receiving')text=b.live_enabled===false?'正在恢复实时 USB 连接…':'ESP 正在接收，等待首个可解包图片片段…';
  if(b.live_failed&&b.rx_active)text='实时 USB 输出中断，完整接收后将补传原图';
+ if(l.streaming)text='正在接收照片及视频，完成后显示图片';
  if(l.state==='receiving')text+=(l.name?' · '+l.name:'')+' · 已转发 '+size(l.archive_bytes)+' · '+((l.bytes_per_s||0)/1024).toFixed(1)+' KiB/s（解包数据平均）';
  $('live-status').textContent=text;
  $('live-progress').value=l.state==='saved'?1:l.total?l.received/l.total:0;
- $('live-note').textContent=(l.note||'JPEG / PNG 可以显示临时画面；HEIC 等格式需等完整文件')+'。此预览由电脑解码，并非墨水屏刷新。';
+ $('live-note').textContent=(l.streaming?'原件正在分块暂存，全部校验并保存后显示。':(l.note||'JPEG / PNG 可以显示临时画面；HEIC 等格式需等完整文件')+'。此预览由电脑解码，并非墨水屏刷新。');
  const finalFile=l.state==='saved'&&!b.rx_active&&files[0]?.preview?files[0]:null;
  $('live-image').hidden=!(l.preview||finalFile);
  $('live-image').alt=finalFile?'已校验并保存的完整图片':'接收中的临时图片，尚未完成校验';
@@ -38,6 +39,8 @@ function renderLive(l,b,files){
 function size(n){return ((n||0)/1048576).toFixed(2)+' MiB'}
 function renderFiles(files){const key=files.map(f=>f.id).join();if(key===shown)return;shown=key;$('gallery').replaceChildren();$('empty').hidden=files.length>0;for(const f of files){const card=document.createElement('article');card.className='card';if(f.preview){const img=document.createElement('img');img.src='/preview/'+f.id;img.alt=f.name;card.append(img)}const info=document.createElement('div');info.className='info';const title=document.createElement('h3');title.textContent=f.name;const note=document.createElement('small');note.textContent=size(f.size)+' · '+f.time+' · '+(f.source==='replay'?'本地回放 CRC32 校验通过':'USB CRC32 校验通过');info.append(title,note);if(f.self_test){const p=document.createElement('p');p.className='test';p.textContent='USB合成测试图（非 iPhone 照片）';info.append(p)}if(!f.preview){const p=document.createElement('p');p.textContent='无法预览，原文件已保存。';info.append(p)}const a=document.createElement('a');a.href='/files/'+f.id;a.textContent='下载原文件';info.append(a);card.append(info);$('gallery').append(card)}}
 async function refresh(){try{const r=await fetch('/api/state');if(!r.ok)throw Error(r.status);const s=await r.json(),b=s.board;$('connection').textContent=b.transport==='replay'?'本地限速回放 · 未使用 ESP / USB':s.connected?s.port+' 已连接 · '+(b.transport==='usb_hwcdc'?'原生 USB CDC':s.baud+' baud'):'USB未连接：'+s.port;$('connection').className=s.connected||b.transport==='replay'?'pill':'error';$('test').hidden=b.transport==='replay';$('memory').textContent=b.psram_bytes?'PSRAM '+size(b.psram_bytes)+' · 剩余 '+size(b.psram_free):'';$('link').textContent=b.ready?'AWDL '+(b.locked?'已同步':b.have_master?'同步中':'等待 iPhone')+' · 已转发 '+b.forwarded+' 个文件':'';const [done,total]=s.serial_progress;
+if(b.chip)$('memory').textContent=b.chip+' · '+$('memory').textContent;
+if(b.ready&&b.radio_channel)$('link').textContent+=(b.radio_channel>14?' · 5 GHz':' · 2.4 GHz')+' / 信道 '+(b.radio_actual_channel||b.radio_channel)+(b.radio_country?' · '+b.radio_country:'');
 let msg=b.boot_error||(!b.ready?'等待板子启动 / 检查烧录与复位':'已就绪，在 iPhone 上选择 Photo Bridge');
 if(b.file_error&&!b.rx_active)msg=b.file_error==='handler refused a file'?'ESP 已收图，但向电脑交付失败；旧固件需重新投送':'上次接收未完成：'+b.file_error+'（已接收 '+size(b.rx_bytes)+'）';
 if(b.rx_active){msg='手机 → ESP：正在接收 '+size(b.rx_bytes);if(s.live?.state==='receiving')msg+=' ｜ 已同步到电脑 '+size(s.live.archive_bytes)}

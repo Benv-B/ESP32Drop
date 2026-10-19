@@ -77,6 +77,7 @@ struct AwdlMifParams {
   uint32_t rx_now_us;            /* now, in the RX timestamp timebase */
   uint32_t phase_us;             /* the window phase in that same timebase */
   uint16_t cur_aw_seq;
+  uint8_t radio_channel;         /* 0 preserves the original channel-6 frame */
 };
 
 static void awdl_put32le(uint8_t *d, uint32_t v) {
@@ -87,6 +88,12 @@ static void awdl_put32le(uint8_t *d, uint32_t v) {
 /* Returns the frame length, or 0 if cap < AWDL_MIF_MAX. */
 static size_t awdl_build_mif(uint8_t *b, size_t cap, const struct AwdlMifParams *m) {
   if (cap < AWDL_MIF_MAX) return 0;
+  const uint8_t channel = m->radio_channel ? m->radio_channel : 6;
+  if (channel != 6 && channel != 44 && channel != 149) return 0;
+  // Global operating classes for 20 MHz. Do not advertise VHT80 (class 128):
+  // the C5 receiver is configured for 20 MHz in this experimental port.
+  const uint8_t opclass = channel == 6 ? 81 : channel == 44 ? 115 : 124;
+  const uint8_t social = channel == 6 ? 1 : channel == 44 ? 2 : 4;
   size_t p = 0;
   // ---- 802.11 mgmt action header (24) ----
   b[p++]=0xd0; b[p++]=0x00; b[p++]=0x00; b[p++]=0x00;
@@ -103,9 +110,9 @@ static size_t awdl_build_mif(uint8_t *b, size_t cap, const struct AwdlMifParams 
   const size_t sync_off = p;                       // = 40; live-overwrite base
   // ---- sync_params (type 4) content=73 ----
   b[p++]=0x04; b[p++]=0x49; b[p++]=0x00;
-  b[p++]=0x06;                                     // next_aw_channel
+  b[p++]=channel;                                  // next_aw_channel
   b[p++]=0x00; b[p++]=0x00;                         // tx_down_counter (live-ish)
-  b[p++]=0x06;                                     // master_channel
+  b[p++]=channel;                                  // master_channel
   b[p++]=0x00;                                     // guard_time
   b[p++]=0x10; b[p++]=0x00;                         // aw_period=16
   b[p++]=0x6e; b[p++]=0x00;                         // af_period=110
@@ -120,7 +127,7 @@ static size_t awdl_build_mif(uint8_t *b, size_t cap, const struct AwdlMifParams 
   b[p++]=0x00; b[p++]=0x00;                         // next_aw_seq (live @sync_off+32)
   b[p++]=0x00; b[p++]=0x00;                         // ap_alignment
   b[p++]=0x0f; b[p++]=0x03; b[p++]=0x00; b[p++]=0x03; b[p++]=0xff; b[p++]=0xff;  // chanseq hdr
-  for (int i=0;i<16;i++){ b[p++]=0x06; b[p++]=0x51; }   // 16x ch6 (opclass)
+  for (int i=0;i<16;i++){ b[p++]=channel; b[p++]=opclass; }
   b[p++]=0x00; b[p++]=0x00;                         // pad
 
   // Coherent leaf election: we advertise ourselves at distance 1 under the REAL
@@ -145,7 +152,7 @@ static size_t awdl_build_mif(uint8_t *b, size_t cap, const struct AwdlMifParams 
   // ---- chanseq (type 18) content=41 ----
   b[p++]=0x12; b[p++]=0x29; b[p++]=0x00;
   b[p++]=0x0f; b[p++]=0x03; b[p++]=0x00; b[p++]=0x03; b[p++]=0xff; b[p++]=0xff;
-  for (int i=0;i<16;i++){ b[p++]=0x06; b[p++]=0x51; }
+  for (int i=0;i<16;i++){ b[p++]=channel; b[p++]=opclass; }
   b[p++]=0x00; b[p++]=0x00; b[p++]=0x00;            // pad(3)
 
   // ---- election_params v2 (type 24) content=40 ----
@@ -218,7 +225,7 @@ static size_t awdl_build_mif(uint8_t *b, size_t cap, const struct AwdlMifParams 
   // ---- ht_capabilities (type 7) content=8 ----
   b[p++]=0x07; b[p++]=0x08; b[p++]=0x00;
   b[p++]=0x00; b[p++]=0x00;                         // unknown
-  b[p++]=0xce; b[p++]=0x11;                         // ht_capabilities=0x11ce
+  b[p++]=channel == 6 ? 0xce : 0xcc; b[p++]=0x11;   // 5 GHz: no 40 MHz capability
   b[p++]=0x1b;                                     // ampdu_params
   b[p++]=0xff;                                     // rx_mcs
   b[p++]=0x00; b[p++]=0x00;                         // unknown2
@@ -237,7 +244,7 @@ static size_t awdl_build_mif(uint8_t *b, size_t cap, const struct AwdlMifParams 
   b[p++]=0x0c; b[p++]=0x0f; b[p++]=0x00;
   b[p++]=0x24; b[p++]=0x8f;                         // flags=0x8f24
   b[p++]='X'; b[p++]='0'; b[p++]=0x00;             // country_code
-  b[p++]=0x01; b[p++]=0x00;                         // social_channels = ch6 bit
+  b[p++]=social; b[p++]=0x00;                       // fixed social channel
   memcpy(&b[p], m->src, 6); p+=6;                  // awdl_addr = OUR mac (EUI-64 neighbour)
   b[p++]=0x00; b[p++]=0x00;                         // ext_flags
 

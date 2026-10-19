@@ -138,6 +138,12 @@ struct AwdlDiag {
   volatile uint32_t ns_to_us;         /* NS whose TARGET is our link-local: a peer is
                                          resolving US, so it means to connect */
   volatile uint32_t netif_rx;         /* frames pushed up into lwIP */
+  volatile uint32_t netif_rx_duplicates; /* previously delivered 802.11 retries */
+  volatile uint32_t data_retry, netif_tx_call_us_max;
+  volatile uint8_t rx_phy_format, rx_phy_rate;
+  volatile uint32_t rx_to_us, rx_to_us_matched, rx_to_us_retry;
+  volatile uint8_t rx_match_mask;
+  volatile uint32_t sync_psf, sync_mif;
   /* Follows AWDL_DIAG_PAYLOAD_MAX, not AWDL_DIAG_DETAIL: this counts CAPTURES, and with
      payload capture off there is nothing to capture -- the count of the frames themselves
      is v6_svc, above, which is always kept. */
