@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import struct
+import json
 import time
 import zlib
 from collections import deque
@@ -56,11 +57,14 @@ class FrameDecoder:
     its entire payload passes CRC32. Transport chunk boundaries have no meaning.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, text_status: bool = False) -> None:
         self.buffer = bytearray()
         self.errors: deque[str] = deque(maxlen=32)
         self.expected_bytes = 0
         self.frame_started: float | None = None
+        self.text_status = text_status
+        self.text_buffer = bytearray()
+        self.text_overflow = False
 
     def reset(self) -> None:
         if self.buffer:
@@ -68,6 +72,40 @@ class FrameDecoder:
         self.buffer.clear()
         self.expected_bytes = 0
         self.frame_started = None
+        self.text_buffer.clear()
+        self.text_overflow = False
+
+    def _noise(self, data: bytes | bytearray) -> list[Frame]:
+        """Read bounded TCON diagnostics only OUTSIDE a binary frame payload."""
+        if not self.text_status:
+            return []
+        frames = []
+        for byte in data:
+            if byte == 10:
+                line = bytes(self.text_buffer).strip()
+                self.text_buffer.clear()
+                overflow, self.text_overflow = self.text_overflow, False
+                if overflow:
+                    continue
+                if line.startswith(b'{'):
+                    try:
+                        value = json.loads(line)
+                        if (isinstance(value, dict) and value.get('output') == 'iris_spi'
+                                and str(value.get('firmware', '')).startswith('xiao-c5-iris-tcon-')
+                                and isinstance(value.get('ready'), bool)
+                                and isinstance(value.get('frame'), dict)):
+                            frames.append(Frame(STATUS, 0, line))
+                    except (ValueError, UnicodeDecodeError):
+                        pass
+                elif line.startswith((b'IRIS ', b'EV ', b'[tls]', b'[tcp]')):
+                    frames.append(Frame(LOG, 0, line))
+            elif not self.text_overflow:
+                if len(self.text_buffer) < 8192:
+                    self.text_buffer.append(byte)
+                else:
+                    self.text_buffer.clear()
+                    self.text_overflow = True
+        return frames
 
     def feed(self, data: bytes | bytearray, *, now: float | None = None) -> list[Frame]:
         now = time.monotonic() if now is None else now
@@ -84,13 +122,18 @@ class FrameDecoder:
         while True:
             start = self.buffer.find(MAGIC)
             if start < 0:
-                # Retain a possible prefix split across two reads, not arbitrary boot logs.
-                if len(self.buffer) >= len(MAGIC):
-                    del self.buffer[:-(len(MAGIC) - 1)]
+                # Keep only an actual possible binary magic prefix. A complete
+                # text line (including its newline) must be dispatched now.
+                keep = next((n for n in range(min(len(self.buffer), len(MAGIC)-1), 0, -1)
+                             if self.buffer[-n:] == MAGIC[:n]), 0)
+                consumed = len(self.buffer) - keep
+                frames.extend(self._noise(self.buffer[:consumed]))
+                del self.buffer[:consumed]
                 self.expected_bytes = 0
                 self.frame_started = None
                 break
             if start:
+                frames.extend(self._noise(self.buffer[:start]))
                 del self.buffer[:start]
             if len(self.buffer) < HEADER.size:
                 break
@@ -105,6 +148,8 @@ class FrameDecoder:
                 self.frame_started = None
                 continue
             total = HEADER.size + length
+            self.text_buffer.clear()
+            self.text_overflow = False
             self.expected_bytes = total
             if self.frame_started is None:
                 self.frame_started = now

@@ -27,6 +27,7 @@ typedef struct {
   Seg seg[MAXSEG]; int nseg, cur, off;
   uint32_t now_ms;
   int close_at_end;
+  int fail_write_call, short_write;
 } Script;
 
 static int script_read(struct HttpRdr *r, unsigned char *buf, int len) {
@@ -67,10 +68,12 @@ typedef struct {
   int      peer_polls;
   int      up_chunked, up_clen;  /* what the upload hook was handed */
   int      upload_drains;        /* 1 = the hook actually drained the body */
+  int      writes;
 } Harness;
 
 static int hz_write(struct HttpServe *sv, const unsigned char *p, int n) {
   Harness *h = (Harness *)sv->io;
+  if (++h->writes == h->s->fail_write_call) return h->s->short_write ? n - 1 : -1;
   if (h->outn + n < (int)sizeof(h->out)) { memcpy(h->out + h->outn, p, n); h->outn += n; }
   return n;
 }
@@ -179,6 +182,39 @@ int main(void) {
                           h.disc_ok, h.out, ordered ? 1 : 0);
     check("/Discover answers 200 + body and consumes the chunked body",
           rsp200 && ordered && h.disc_ok == 1 && has_log(&h, "disc_sent"), d);
+  }
+
+  /* A Discover body can follow its headers in the next AW cycle. Reply first,
+     but do not abandon a correctly framed body before that window arrives. */
+  {
+    const char headers[] = "POST /Discover HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+    const char body[] = "5\r\nHELLO\r\n0\r";
+    const char tail[] = "\n\r\n";
+    Script s = {0}; s.close_at_end = 1;
+    script_add(&s, 0, headers, sizeof(headers)-1);
+    script_add(&s, 1050, body, sizeof(body)-1);
+    script_add(&s, 2100, tail, sizeof(tail)-1);
+    Harness h; harness_run(&h, &s);
+    check("Discover replies immediately and drains body across two AW cycles",
+          h.disc_ok == 1 && h.disc_ms == 0 && s.now_ms == 2100 &&
+          has_log(&h, "disc_drain complete=1 eof=0 timeout=0"), NULL);
+  }
+  {
+    const char headers[] = "POST /Discover HTTP/1.1\r\nContent-Length: 5\r\n\r\n";
+    Script s = {0}; script_add(&s, 0, headers, sizeof(headers)-1);
+    Harness h; harness_run(&h, &s);
+    check("silent Discover body gives up after three seconds without fake completion",
+          h.disc_ok == 1 && h.disc_ms == 0 && s.now_ms == 3000 &&
+          has_log(&h, "disc_drain complete=0 eof=0 timeout=1"), NULL);
+  }
+
+  {
+    const char headers[] = "POST /Ask HTTP/1.1\r\nContent-Length: 5\r\n\r\n";
+    Script s = {0}; script_add(&s, 0, headers, sizeof(headers)-1);
+    Harness h; harness_run_options(&h, &s, UINT32_MAX, true, true);
+    check("keep-alive Ask with an absent fixed body is never accepted",
+          h.ask_ok == 0 && h.ask_sent == 0 && h.outn == 0 && s.now_ms == 10000 &&
+          has_log(&h, "ask_body_incomplete"), NULL);
   }
 
   /* 2. /Ask: answers 200 with Connection: close, flips the UI hook, does NOT
@@ -378,6 +414,38 @@ int main(void) {
     Harness h; harness_run_options(&h, &s, 500, true, true);
     check("keep-alive yields promptly to a new upload connection",
           !h.uploads && s.now_ms >= 500 && s.now_ms < 1000, NULL);
+  }
+  {
+    const char ask[] = "POST /Ask HTTP/1.1\r\nContent-Length: 0\r\n\r\nPOST /Up";
+    const char tail[] = "load HTTP/1.1\r\nContent-Length: 3\r\n\r\nABC";
+    Script s = {0}; s.close_at_end = 1;
+    script_add(&s, 0, ask, sizeof(ask)-1);
+    script_add(&s, 1500, tail, sizeof(tail)-1);
+    Harness h; harness_run_options(&h, &s, UINT32_MAX, true, true);
+    check("keep-alive tolerates a request line split across AW cycles",
+          h.ask_ok == 1 && h.uploads == 1 && h.upload_drains && !h.desync, NULL);
+  }
+  for (int request = 0; request < 3; ++request) {
+    for (int write = 1; write <= 2; ++write) {
+      const char *req = request == 0
+        ? "POST /Discover HTTP/1.1\r\nContent-Length: 0\r\n\r\n"
+        : "POST /Ask HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+      Script s = {0}; s.close_at_end = 1;
+      s.fail_write_call = write; s.short_write = write == 2;
+      script_add(&s, 0, req, (int)strlen(req));
+      Harness h; harness_run_options(&h, &s, 0, true, request == 2);
+      check("failed/short discovery or Ask write never counts acceptance or starts upload",
+            !h.disc_ok && !h.ask_ok && !h.ask_sent && !h.uploads &&
+            h.writes == write && has_log(&h, "response_write_failed"), NULL);
+    }
+  }
+  {
+    const char req[] = "POST /Discover HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 0\r\n\r\n";
+    Script s = {0}; s.fail_write_call = 1;
+    script_add(&s, 0, req, sizeof(req)-1);
+    Harness h; harness_run(&h, &s);
+    check("failed interim response terminates before discovery acceptance",
+          !h.disc_ok && h.writes == 1 && has_log(&h, "response_write_failed"), NULL);
   }
   printf("\n%d checks, %d failed\n", ran, fails);
   return fails ? 1 : 0;

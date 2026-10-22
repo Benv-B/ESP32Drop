@@ -109,7 +109,10 @@ static void hr_skip(struct HttpRdr *r, uint32_t len) {
   while (len > 0) {
     int t = (len < 512) ? (int)len : 512;
     int g = hr_read(r, tmp, t);
-    if (g <= 0) break;
+    // Even zero bytes at a discard-block boundary leave this declared body
+    // incomplete. hr_read only poisons nonzero partial reads; relying on it
+    // alone falsely accepted an absent Content-Length body as fully drained.
+    if (g != t) { r->poisoned = true; return; }
     len -= (uint32_t)g;
   }
 }

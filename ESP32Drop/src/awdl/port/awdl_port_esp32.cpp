@@ -49,6 +49,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "soc/soc_caps.h"
 #include "lwip/sockets.h"
 
@@ -84,7 +85,12 @@ static const BaseType_t AWDL_TASK_CORE = portNUM_PROCESSORS > 1 ? 1 : 0;
  * incomplete TCP segment and drops it -- while a SYN still fits, so the connection is
  * accepted and the socket then never becomes readable, which reads as a peer that dialled
  * in and said nothing. */
+#if CONFIG_IDF_TARGET_ESP32C5
+// C5 storage is PSRAM. Accommodate a burst without taking TLS's internal SRAM.
+#define RING_SLOTS 32
+#else
 #define RING_SLOTS 16
+#endif
 #define SNAP_LEN   1600
 struct RawFrame {
   uint32_t rx_ts;    /* hardware rx timestamp (us)                            */
@@ -116,8 +122,18 @@ static bool     awdl_win_phase(const struct AwdlWinState *w, int64_t *out);
    the callback that reads it (through awdl_tx_ip6_now) is reached by an INDIRECT call
    into another translation unit. A compiler is entitled to conclude that nothing between
    the two stores can observe it and delete them both. volatile removes the question for
-   free; the alternative is a permission that works at -O0 and not at -Os. */
-static volatile bool  g_in_tap = false;
+   free; the alternative is a permission that works at -O0 and not at -Os.
+
+   TWO FLAGS, ONE PER TASK, and one shared bool was wrong. The RX tap runs on awdl_proc
+   (priority 3) and the announce hook on awdl_cad (priority 2), both on core 1. With a
+   single flag, a frame arriving between the cadence task's store and its own
+   awdl_tx_ip6_now() cleared it underneath the announcement, which was then REFUSED --
+   silently, at a rate proportional to the frame rate, on the C5 build where the directed
+   announcement is the only unsolicited discovery it has (g_tx_now_refused was the only
+   trace). One flag per task makes each permission independent; awdl_tx_ip6_now() accepts
+   either. */
+static volatile bool  g_in_rx_tap = false;      // set by awdl_proc around the RX tap
+static volatile bool  g_in_announce = false;    // set by awdl_cad around the announce hook
 static awdl_rx_tap_fn g_rx_tap = nullptr;
 static void          *g_rx_tap_ctx = nullptr;
 static int  build_awdl_data(uint8_t *out, const uint8_t *dst_mac, uint16_t ethertype,
@@ -223,10 +239,10 @@ static size_t trace_read(char *dst, size_t cap) {
   if (lost) return (size_t)snprintf(dst, cap, "XTRACE lost=%lu\n", (unsigned long)lost);
   if (!have) return 0;
   return (size_t)snprintf(dst, cap,
-    "XTRACE t=%lu %c peer=%02x%02x%02x%02x%02x%02x nh=%u p=%u>%u f=%02x s=%lu a=%lu n=%u ttl0=%u rc=%ld\n",
+    "XTRACE t=%lu %c peer=%02x%02x%02x%02x%02x%02x nh=%u p=%u>%u f=%02x s=%lu a=%lu n=%u ttl0=%u rc=%ld wnd=%u mss=%u\n",
     (unsigned long)e.ms, e.direction, e.peer[0],e.peer[1],e.peer[2],e.peer[3],e.peer[4],e.peer[5],
     e.kind,e.sport,e.dport,e.flags,(unsigned long)e.seq,(unsigned long)e.ack,
-    e.size,e.zero_ttl,(long)e.result);
+    e.size,e.zero_ttl,(long)e.result,e.window,e.mss);
 }
 #else
 static void trace_ip(char, const uint8_t *, const uint8_t *, size_t, int32_t) {}
@@ -558,11 +574,33 @@ static const float SRCHIST_THRESH = 0.35f;  // ch6 above 35% of (peak - backgrou
 // Wi-Fi invokes sniffer_cb in task context. Payload copies may live in PSRAM;
 // keep the cursors/control structures internal. C5 has less SRAM than S3.
 static RawFrame *g_ring = nullptr;
+// Static lifetime avoids notifying a task handle that shutdown has already deleted.
+// A binary wake coalesces bursts; the ring remains the authoritative work queue.
+static StaticSemaphore_t g_rx_ready_storage;
+static SemaphoreHandle_t g_rx_ready = nullptr;
 #else
 static RawFrame g_ring[RING_SLOTS];
 #endif
 static struct AwdlRing g_ring_cur;     // cursors + drop count (awdl_ring.h)
 static_assert(AWDL_RING_POW2(RING_SLOTS), "RING_SLOTS must be a power of two");
+
+static void stage_rx_frame(const uint8_t *data, uint16_t len, uint32_t rx_ts,
+                           int64_t now_us, int8_t rssi) {
+  const int slot = awdl_ring_reserve(&g_ring_cur);
+  if (slot < 0) return;                 // full is counted; never block Wi-Fi
+  RawFrame *f = &g_ring[slot];
+  f->rx_ts = rx_ts; f->now_us = now_us; f->rssi = rssi;
+  f->len = len > SNAP_LEN ? SNAP_LEN : len;
+  memcpy(f->data, data, f->len);
+  awdl_ring_commit(&g_ring_cur);
+  const uint32_t used = awdl_ring_used(&g_ring_cur);
+  if (used > g_diag.rx_ring_peak) g_diag.rx_ring_peak = used;
+#if CONFIG_IDF_TARGET_ESP32C5
+  // The callback is a Wi-Fi TASK, not an ISR. Publish before waking the consumer.
+  // A wake arriving between the consumer's empty check and wait stays pending.
+  if (g_rx_ready) xSemaphoreGive(g_rx_ready);
+#endif
+}
 
 // ---- promiscuous RX callback (core 0, WiFi task) — KEEP MINIMAL -------------
 static void sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
@@ -599,17 +637,7 @@ static void sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
 
   // Drop rather than wait when the consumer is behind: this is the WiFi task, and
   // blocking here costs the transmit window. awdl_ring counts what was dropped.
-  int slot = awdl_ring_reserve(&g_ring_cur);
-  if (slot >= 0) {
-    RawFrame *f = &g_ring[slot];
-    f->rx_ts = pkt->rx_ctrl.timestamp;
-    f->now_us = t0;
-    f->rssi = pkt->rx_ctrl.rssi;
-    uint16_t L = len > SNAP_LEN ? SNAP_LEN : len;
-    f->len = L;
-    memcpy(f->data, pl, L);
-    awdl_ring_commit(&g_ring_cur);
-  }
+  stage_rx_frame(pl, len, pkt->rx_ctrl.timestamp, t0, pkt->rx_ctrl.rssi);
   uint32_t dt = (uint32_t)(esp_timer_get_time() - t0);
   if (dt > g_diag.cb_max_us) g_diag.cb_max_us = dt;
   g_diag.cb_sum_us += dt;
@@ -1031,11 +1059,11 @@ static void handle_data(const uint8_t *pl, uint16_t len) {
   //
   // It runs ON THE FRAME TASK, so invariant (a) is the tap's contract too: no Serial, no
   // lwIP, no blocking. awdl_diag_stage() and awdl_tx_ip6_now() are the only legal side
-  // effects, and the second is ENFORCED rather than documented -- see g_in_tap.
+  // effects, and the second is ENFORCED rather than documented -- see g_in_rx_tap.
   if (g_rx_tap && iplen > 0) {
-    g_in_tap = true;
+    g_in_rx_tap = true;
     g_rx_tap(g_rx_tap_ctx, &pl[10], ip, (size_t)iplen);
-    g_in_tap = false;
+    g_in_rx_tap = false;
   }
 
   if (nh == 58) {
@@ -1069,6 +1097,8 @@ static void handle_data(const uint8_t *pl, uint16_t len) {
 
 static void process_frame(const RawFrame *f) {
   int64_t t0 = esp_timer_get_time();
+  const uint32_t queued_us = (uint32_t)(t0 - f->now_us);
+  if (queued_us > g_diag.rx_queue_us_max) g_diag.rx_queue_us_max = queued_us;
   const uint8_t *pl = f->data;
   const uint16_t len = f->len;
   g_diag.last_rssi = f->rssi;
@@ -1234,8 +1264,15 @@ static void proc_task(void *) {
       process_frame(&g_ring[slot]);
       awdl_ring_release(&g_ring_cur);
       did = true;
+      if (g_awdl_stop) break;  // stop between frames, even under continuous traffic
     }
-    if (!did) vTaskDelay(1);   // ~1 tick idle; bursts drain immediately
+    if (!did) {
+#if CONFIG_IDF_TARGET_ESP32C5
+      xSemaphoreTake(g_rx_ready, portMAX_DELAY);
+#else
+      vTaskDelay(1);
+#endif
+    }
   }
 }
 
@@ -1600,7 +1637,7 @@ static volatile uint32_t g_tx_now_n = 0, g_tx_now_err = 0;
 static volatile int32_t  g_tx_now_last = 0;
 
 int awdl_tx_ip6_now(const uint8_t dst[6], uint8_t *buf, size_t len) {
-  if (!g_in_tap) { g_tx_now_refused++; return -1; }
+  if (!g_in_rx_tap && !g_in_announce) { g_tx_now_refused++; return -1; }
   /* 1400 of IPv6, and deliberately NOT AWDL_NETIF_MTU. This path bypasses the netif
    * entirely -- it is how a reply reaches the air from inside an RX tap -- so the netif's
    * 1280-byte cap does not constrain it. What does is esp_wifi_80211_tx, which refuses a
@@ -1693,7 +1730,7 @@ static_assert(AWDL_NETIF_MTU >= 1280, "IPv6 requires a link MTU of at least 1280
  * awdl_netif_transmit() refuses anything larger than AWDL_NETIF_MTU, and build_awdl_data
  * adds exactly AWDL_TX_HEADROOM on top, so this is the largest frame that can ever be
  * built -- and the static_assert above proves it stays inside the driver's 1500-byte
- * limit. Sixteen of these is the queue; at 1600 bytes a slot it was 25,632 B of internal
+ * limit. The default queue has sixteen slots; at 1600 bytes a slot it was 25,632 B of internal
  * DRAM, most of it unreachable. */
 struct NetifTxFrame { uint16_t len; uint8_t buf[AWDL_NETIF_MTU + AWDL_TX_HEADROOM]; };
 static QueueHandle_t g_netif_txq = nullptr;
@@ -1706,8 +1743,7 @@ static uint8_t *g_netif_txq_storage = nullptr;
  * driver accepts it, but its completion callback reports frequent unicast failures and
  * supplies no automatic reliability usable by the netif. Retain a bounded retry count by
  * AWDL data sequence (the sequence is part of the frame and therefore survives the
- * callback). NETIF_TX_RETRY_SLOTS (64) direct-mapped entries are enough: at most 16 frames
- * are queued and a callback arrives long before 64 new netif packets can reuse a slot. Slot
+ * callback). NETIF_TX_RETRY_SLOTS (64) exceeds the bounded queue plus in-flight gate. Slot
  * aliasing is caught regardless -- every reader compares the FULL 16-bit sequence, not just
  * the slot index -- so a stale callback for a recycled slot is ignored, never misapplied. */
 static const uint8_t NETIF_TX_RETRY_MAX = 7;
@@ -1736,6 +1772,8 @@ static NetifTxFrame *g_retry_frame = nullptr;
 #endif
 static_assert(AWDL_NETIF_INFLIGHT_MAX >= 1 && AWDL_NETIF_INFLIGHT_MAX <= 16,
               "AWDL_NETIF_INFLIGHT_MAX must be between 1 and the netif queue depth");
+static_assert(AWDL_NETIF_TX_QUEUE_DEPTH + AWDL_NETIF_INFLIGHT_MAX < NETIF_TX_RETRY_SLOTS,
+              "Retry tracking must exceed queued and in-flight frames");
 static portMUX_TYPE g_netif_tx_mux = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint8_t  g_netif_inflight = 0;
 static volatile uint16_t g_netif_inflight_seq[NETIF_TX_RETRY_SLOTS];
@@ -1806,9 +1844,9 @@ static void raw_tx_done_cb(const esp_80211_tx_info_t *ti) {
     const bool mcast = (f[4] & 0x01) != 0;
     if (mcast) {
       if (ok) g_diag.txdone_mcast_ok++; else g_diag.txdone_mcast_fail++;
-      return;                         // multicast has no link-layer ACK to recover
+    } else {
+      if (ok) g_diag.txdone_ucast_ok++; else g_diag.txdone_ucast_fail++;
     }
-    if (ok) g_diag.txdone_ucast_ok++; else g_diag.txdone_ucast_fail++;
 
     /* Only our AWDL/IPv6 netif shape. This excludes hidden-AP traffic and makes every
        offset below guarded: LLC ends at 31, AWDL seq is 34..35, IPv6 starts at 40. */
@@ -1818,7 +1856,9 @@ static void raw_tx_done_cb(const esp_80211_tx_info_t *ti) {
        admitted by the queued netif. Do not let it release the gate or enter retry. */
     if (!netif_inflight_done(seq)) return;
     if (g_cadence_task) xTaskNotifyGive(g_cadence_task);
-    if (ok) return;
+    // Every owned completion frees its slot. Multicast has no link-layer ACK
+    // to recover, but returning before release can permanently fill the gate.
+    if (ok || mcast) return;
     const uint8_t slot = (uint8_t)(seq & (NETIF_TX_RETRY_SLOTS - 1));
     if (g_retry_seq[slot] != seq || g_retry_n[slot] >= NETIF_TX_RETRY_MAX) {
       g_diag.netif_retry_exhausted++;
@@ -2022,10 +2062,10 @@ static esp_err_t awdl_netif_post_attach(esp_netif_t *netif, void *h) {
 
 static esp_err_t awdl_netif_init(void) {
 #if CONFIG_IDF_TARGET_ESP32C5
-  g_netif_txq = xQueueCreateStatic(16, sizeof(NetifTxFrame), g_netif_txq_storage,
+  g_netif_txq = xQueueCreateStatic(AWDL_NETIF_TX_QUEUE_DEPTH, sizeof(NetifTxFrame), g_netif_txq_storage,
                                   &g_netif_txq_control);
 #else
-  g_netif_txq = xQueueCreate(16, sizeof(NetifTxFrame));  // 16 x (MTU+headroom); holds a full TLS
+  g_netif_txq = xQueueCreate(AWDL_NETIF_TX_QUEUE_DEPTH, sizeof(NetifTxFrame)); // holds a full TLS
                                                          // ServerHello flight burst between
                                                          // ch6 windows without dropping frames
 #endif
@@ -2357,14 +2397,16 @@ void awdl_cadence_pass(void) {
     // callback. Nested inside do_mif: an announcement rides a window we have already
     // decided to transmit in.
     if (out.do_announce && g_announce_cb) {
-      // The same in-callback flag the RX tap sets. Without it awdl_tx_ip6_now() refuses
-      // the announcement, and the failure is silent in every health indicator: late=0,
-      // locked=1, masters=2, all green, and mdns_tx frozen at zero. A badge that is
-      // perfectly synchronised and advertises nothing is invisible; this counter is the
-      // only thing that says so.
-      g_in_tap = true;
+      // The cadence's own permission flag, separate from the RX tap's: the two tasks
+      // must not be able to clear each other's, or an announcement is silently refused
+      // whenever a frame lands between the store below and the transmit inside it.
+      // Without a flag at all awdl_tx_ip6_now() refuses the announcement, and the
+      // failure is silent in every health indicator: late=0, locked=1, masters=2, all
+      // green, and mdns_tx frozen at zero. A badge that is perfectly synchronised and
+      // advertises nothing is invisible; this counter is the only thing that says so.
+      g_in_announce = true;
       g_announce_cb(g_announce_ctx);
-      g_in_tap = false;
+      g_in_announce = false;
     }
   }
   if (out.drain_max) awdl_netif_flush_tx(out.drain_max, out.drain_until_us);
@@ -2431,6 +2473,7 @@ void awdl_diag_read(struct AwdlDiag *out, bool clear_maxima) {
   /* Three counters live in objects of their own and are folded in here rather than
      published separately: two ring cursors and the PLL's re-seed pair. */
   g_diag.ring_drop  = g_ring_cur.drops;
+  g_diag.rx_ring_capacity = RING_SLOTS - 1;
   g_diag.dump_drop  = g_dump_proc.cur.drops;
   g_diag.pll_relock = g_pll.n_relock;
   g_diag.pll_out    = g_pll.n_out;
@@ -2507,7 +2550,7 @@ esp_err_t awdl_begin(void) {
   if (!g_ring) g_ring = (RawFrame *)heap_caps_malloc(sizeof(RawFrame) * RING_SLOTS,
                                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!g_netif_txq_storage)
-    g_netif_txq_storage = (uint8_t *)heap_caps_malloc(16 * sizeof(NetifTxFrame),
+    g_netif_txq_storage = (uint8_t *)heap_caps_malloc(AWDL_NETIF_TX_QUEUE_DEPTH * sizeof(NetifTxFrame),
                                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!g_ring || !g_netif_txq_storage) {
     free(g_ring); g_ring = nullptr;
@@ -2517,6 +2560,12 @@ esp_err_t awdl_begin(void) {
 #endif
 
   awdl_ring_init(&g_ring_cur, RING_SLOTS);
+  g_diag.rx_ring_peak = g_diag.rx_queue_us_max = 0;
+#if CONFIG_IDF_TARGET_ESP32C5
+  if (!g_rx_ready) g_rx_ready = xSemaphoreCreateBinaryStatic(&g_rx_ready_storage);
+  if (!g_rx_ready) return ESP_ERR_NO_MEM;
+  xSemaphoreTake(g_rx_ready, 0);  // discard an old wake before enabling callbacks
+#endif
   awdl_winstate_init(&g_win);
   g_sel_pub.idx = -1;
   awdl_ring_init(&g_dump_proc.cur, DUMP_SLOTS);
@@ -2595,14 +2644,16 @@ esp_err_t awdl_end(void) {
   g_proc_stopped = g_cad_stopped = false;
   g_awdl_stop = true;
   if (g_cadence_task) xTaskNotifyGive(g_cadence_task);
+#if CONFIG_IDF_TARGET_ESP32C5
+  if (g_rx_ready) xSemaphoreGive(g_rx_ready);
+#endif
 #if AWDL_CADENCE_TASK
   const bool want_cad = true;
 #else
   const bool want_cad = false;
 #endif
-  /* One availability window is 1,048,576 us and proc_task's own idle sleep is one tick,
-     so a second is two orders of magnitude of slack. If they have not answered by then
-     something is wrong that freeing memory would only make worse. */
+  /* Both idle tasks are woken above. If they have not answered within this bounded
+     wait, freeing memory would only make the shutdown failure worse. */
   for (int i = 0; i < 1000; i++) {
     if (g_proc_stopped && (!want_cad || g_cad_stopped)) break;
     vTaskDelay(1);

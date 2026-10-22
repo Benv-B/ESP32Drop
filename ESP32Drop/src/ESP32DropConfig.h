@@ -23,6 +23,15 @@
 #define AWDL_C5_BSSID_FILTER 0
 #endif
 
+// The 16 KiB TCP-window benchmark can burst more ACKs between AWDL windows.
+// Keep the original queue by default; extra C5 queue storage lives in PSRAM.
+#ifndef AWDL_NETIF_TX_QUEUE_DEPTH
+#define AWDL_NETIF_TX_QUEUE_DEPTH 16
+#endif
+#if AWDL_NETIF_TX_QUEUE_DEPTH != 16 && AWDL_NETIF_TX_QUEUE_DEPTH != 32
+#error "AWDL_NETIF_TX_QUEUE_DEPTH must be 16 or 32"
+#endif
+
 // ASCII bytes avoid shell-dependent quoting of compiler string definitions.
 // 01 is the SDK's world default; deployment must use the actual country.
 #ifndef AWDL_COUNTRY_0

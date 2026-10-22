@@ -16,7 +16,7 @@ int main(void) {
   ip[0] = 0x60; ip[6] = 17; ip[5] = (uint8_t)(dn + 8);
   ip[40] = ip[42] = 0x14; ip[41] = ip[43] = 0xe9; ip[45] = ip[5];
   assert(awdl_trace_classify(ip, dn + 48, &e) && e.kind == 17 && e.zero_ttl == 3);
-  struct AdDnssdOwn own = {"2a8485450bc0", "M5 Badge"};
+  struct AdDnssdOwn own = {"2a8485450bc0", "M5 Badge", true};
   assert(ip[50] & 0x80); // Existing RX tap's is_query branch is NOT entered.
   assert(!ad_dnssd_known_answer_suppresses(ip + 48, dn, &own));
   for (int n = 0; n < dn + 48; ++n) assert(!awdl_trace_classify(ip, n, &e));
@@ -35,6 +35,20 @@ int main(void) {
   ip[53] = 0x10; assert(!awdl_trace_classify(ip, tn, &e)); // ordinary ACK ignored
   ip[53] = 0x11; assert(awdl_trace_classify(ip, tn, &e)); // FIN
   ip[53] = 2; assert(awdl_trace_classify(ip, tn, &e)); // SYN
+  ip[54] = 0x40; ip[55] = 0;
+  assert(awdl_trace_classify(ip, tn, &e) && e.window == 16384);
+  ip[54] = 0x16; ip[55] = 0x80;
+  assert(awdl_trace_classify(ip, tn, &e) && e.window == 5760);
+  ip[5] = 24; ip[52] = 0x60;
+  ip[60] = 2; ip[61] = 4; ip[62] = 0x04; ip[63] = 0xc4;
+  assert(awdl_trace_classify(ip, 64, &e) && e.mss == 1220);
+  ip[62] = 0x05; ip[63] = 0x78;
+  assert(awdl_trace_classify(ip, 64, &e) && e.mss == 1400);
+  for (int n = 0; n < 64; ++n) assert(!awdl_trace_classify(ip, n, &e));
+  ip[61] = 0; assert(awdl_trace_classify(ip, 64, &e) && e.mss == 0);
+  ip[61] = 5; assert(awdl_trace_classify(ip, 64, &e) && e.mss == 0);
+  ip[60] = 1; ip[61] = 0; assert(awdl_trace_classify(ip, 64, &e) && e.mss == 0);
+  ip[5] = 20;
   ip[52] = 0xf0; assert(!awdl_trace_classify(ip, tn, &e));
   ip[52] = 0x40; assert(!awdl_trace_classify(ip, tn, &e));
   puts("transfer trace: captured goodbye/RST, truncations and malformed bounds PASS");

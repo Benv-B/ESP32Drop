@@ -165,6 +165,7 @@ class SerialReader(threading.Thread):
         self.last_reference: bytes | None = None
         self.last_reference_key: bytes | None = None
         self.last_uptime: int | None = None
+        self.last_file_error = ""
         self.delivery_lock = threading.Lock()
         self.deliveries = OrderedDict()
         self.delivery_epoch = 0
@@ -387,6 +388,8 @@ class SerialReader(threading.Thread):
     def self_test(self):
         with self.gallery.lock:
             board = self.gallery.board
+            if board.get("output") == "iris_spi":
+                raise RuntimeError("实屏固件请从 iPhone 投送照片；不支持 USB 合成图片测试")
             if board.get("rx_active") or board.get("delivery_pending") or board.get("frame", {}).get("off_requested"):
                 raise RuntimeError("请等待收图完成，或先恢复接收")
         with self.write_lock:
@@ -411,7 +414,12 @@ class SerialReader(threading.Thread):
 
     def handle_status(self, status: dict):
         uptime = status.get("uptime_ms", 0)
-        if self.last_uptime is not None and uptime < self.last_uptime:
+        with self.gallery.lock:
+            old_frame = self.gallery.board.get("frame", {})
+        new_boot = status.get("frame", {}).get("boot")
+        rebooted = (status.get("output") == "iris_spi" and old_frame.get("boot") is not None
+                    and new_boot != old_frame.get("boot"))
+        if rebooted or (self.last_uptime is not None and uptime < self.last_uptime):
             self.live_archive.reset()
             self.archive_stream.reset()
             self.last_reference = self.last_reference_key = None
@@ -422,11 +430,18 @@ class SerialReader(threading.Thread):
         if not status.get("rx_active") and status.get("file_error") and self.archive_stream.file:
             self.archive_stream.reset()
             self.gallery.clear_live("aborted")
+        # The reason, not just the count: over the archive cap, an unsupported format and a
+        # transport failure are three different things to do something about.
+        reason = status.get("error") or status.get("file_error") or ""
+        if reason != self.last_file_error:
+            self.last_file_error = reason
+            if reason:
+                self.gallery.log(f"接收被拒：{reason}")
         # HWCDC can briefly report disconnected without the COM port closing.
         # Firmware then clears LIVE. Renew on every status, not only at boot;
         # LIVE is idempotent and must never rewind an archive already in flight.
         with self.write_lock:
-            if self.connection is not None:
+            if self.connection is not None and status.get("output") != "iris_spi":
                 self.connection.write(b"LIVE\nSAVE\n")
         with self.gallery.lock:
             old_frame = self.gallery.board.get("frame", {})
@@ -434,7 +449,7 @@ class SerialReader(threading.Thread):
         frame = status.get("frame", {})
         if frame.get("enabled"):
             if frame.get("boot") != old_frame.get("boot"):
-                wake = {"nfc_field": "NFC 触碰", "usb_command": "电脑恢复命令", "reset": "上电或其他复位"}.get(frame.get("wake_reason"), "旧固件未记录")
+                wake = {"nfc_field": "NFC 触碰", "usb_command": "电脑恢复命令", "reset": "上电或其他复位", "stop_failed": "关机时射频未能停止，已自动重启"}.get(frame.get("wake_reason"), "旧固件未记录")
                 self.gallery.log(f"相框启动 #{frame.get('boot')} · {status.get('firmware', '')} · 启动原因：{wake}")
             if frame.get("state") != old_frame.get("state"):
                 self.gallery.log(f"相框状态：{frame.get('state')} · 原因：{frame.get('reason') or '-'}")
@@ -445,7 +460,7 @@ class SerialReader(threading.Thread):
         self.file_worker.start()
         self.preview_worker.start()
         while not self.stop_event.is_set():
-            decoder = FrameDecoder()
+            decoder = FrameDecoder(text_status=True)
             try:
                 connection = serial.Serial(baudrate=self.gallery.baud, timeout=0.2,
                                            write_timeout=2, rtscts=False, dsrdtr=False)
@@ -459,6 +474,7 @@ class SerialReader(threading.Thread):
                     self.usb_serial_number = device.serial_number
                 connection.port = port
                 connection.open()
+                connection.dtr = True  # native CDC diagnostics require an attached host
                 with self.write_lock:
                     self.connection = connection
                     self.delivery_epoch += 1
@@ -467,7 +483,7 @@ class SerialReader(threading.Thread):
                     self.gallery.port = port
                     self.gallery.board = {}
                 # Empty command establishes HWCDC host activity without resetting it.
-                connection.write(b"\nLIVE\nSAVE\n")
+                connection.write(b"\nSTATUS\nLIVE\nSAVE\n")
                 self.gallery.log(f"Connected {self.gallery.port} @ {self.gallery.baud}")
                 last_data = time.monotonic()
                 self.last_uptime = None

@@ -44,6 +44,25 @@ class UsbPortTests(unittest.TestCase):
 
 
 class ViewerTests(unittest.TestCase):
+    def test_tcon_status_controls_and_specific_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gallery = Gallery(Path(tmp), 'TEST', 115200)
+            reader = SerialReader(gallery)
+            reader.connection = Mock(is_open=True)
+            status = {'output':'iris_spi','firmware':'xiao-c5-iris-tcon-2',
+                      'error':'TCON DRAM parity error','file_error':'output chunk not acknowledged',
+                      'frame':{'enabled':True,'boot':1,'state':'retry'}}
+            reader.handle_status(status)
+            self.assertEqual(gallery.board, status)
+            reader.connection.write.assert_not_called()  # no binary LIVE/SAVE subscription
+            self.assertTrue(any('DRAM parity' in line for line in gallery.snapshot()['logs']))
+            with self.assertRaises(RuntimeError): reader.self_test()
+            reader.frame_control('hold')
+            reader.connection.write.assert_called_once_with(b'FRAME HOLD\n')
+            epoch = reader.delivery_epoch
+            reader.handle_status(dict(status, frame={'enabled':True,'boot':2}))
+            self.assertEqual(reader.delivery_epoch, epoch+1)
+
     def test_frame_controls_are_whitelisted_and_require_integrated_firmware(self):
         with tempfile.TemporaryDirectory() as tmp:
             gallery = Gallery(Path(tmp), "TEST", 921600)

@@ -1,10 +1,10 @@
 # XIAO ESP32-C5 / ESP32-S3 照片桥接
 
-**已焊好的 RevC 相框载板**：使用 [NFC 唤醒与 USB 预览整合版](../docs/photo-frame.md)，构建命令为 `tools/build-photo-frame.ps1`，AirDrop 名称为 **Photo Frame**。下文保留普通照片桥接的构建与历史基线说明。
+**已焊好的 RevC 相框载板**：当前 `tools/build-photo-frame.ps1` 构建 [IRIS 实屏固件](../docs/iris-tcon.md)，AirDrop 名称为 **Photo Frame**。本查看器也支持该固件的纯文本 JSON 状态、具体错误和电源控制；实屏模式不向电脑传送图片，隐藏 USB 合成图片测试。下文保留普通照片桥接的构建与历史基线说明。
 
 **iPhone 原生隔空投送 → Photo Bridge / XIAO → 原生 USB CDC → 电脑保存静态照片。**
 
-当前优先维护 C5 的无线发现、静态照片接收与稳定性。USB 是现阶段输出消费者，后续可由 SPI 替换；SPI 驱动尚未实现。不开发实况播放或视频功能，分享实况来源的照片时请先在 iPhone 分享页关闭“实况”。
+下文主要记录历史 USB 桥接模式。当前相框已实现 SPI/TCON 实屏输出，见上方 IRIS 实屏固件说明；USB 桥接模式仍保留用于回归测试。不开发实况播放或视频功能，分享实况来源的照片时请先在 iPhone 分享页关闭“实况”。
 
 换电脑开发请从 [C5 交接说明](../docs/c5-handoff.md) 开始；本分支保存已实测接收静态图的清理版。
 

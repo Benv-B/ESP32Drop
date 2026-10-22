@@ -1,12 +1,50 @@
 import random
+import json
 import struct
 import unittest
 import zlib
 
-from protocol import FILE, HEADER, LOG, MAGIC, MAX_PAYLOAD, FrameDecoder, encode_frame, file_payload, unpack_file
+from protocol import FILE, HEADER, LOG, STATUS, MAGIC, MAX_PAYLOAD, FrameDecoder, encode_frame, file_payload, unpack_file
 
 
 class ProtocolTests(unittest.TestCase):
+    @staticmethod
+    def tcon_line():
+        return (json.dumps({'firmware':'xiao-c5-iris-tcon-2','output':'iris_spi',
+                            'ready':True,'frame':{'enabled':True,'boot':2},
+                            'error':'TCON DRAM parity error'})+'\n').encode()
+
+    def test_tcon_status_every_split_and_single_bytes(self):
+        line = self.tcon_line()
+        for split in range(len(line)+1):
+            decoder = FrameDecoder(text_status=True)
+            frames = decoder.feed(line[:split]) + decoder.feed(line[split:])
+            self.assertEqual([f.kind for f in frames], [STATUS])
+            self.assertEqual(json.loads(frames[0].payload)['frame']['boot'], 2)
+        decoder = FrameDecoder(text_status=True)
+        frames = [f for b in line for f in decoder.feed(bytes([b]))]
+        self.assertEqual(len(frames), 1)
+
+    def test_tcon_text_never_parsed_inside_binary_photo(self):
+        line = self.tcon_line()
+        packet = encode_frame(FILE, 9, file_payload('photo.jpg', b'\n'+line+b'ESPDROP1'))
+        decoder = FrameDecoder(text_status=True)
+        frames = []
+        for byte in line + packet + b'IRIS ERROR: test\n' + line:
+            frames.extend(decoder.feed(bytes([byte])))
+        self.assertEqual([f.kind for f in frames], [STATUS, FILE, LOG, STATUS])
+        self.assertEqual(unpack_file(frames[1].payload)[1], b'\n'+line+b'ESPDROP1')
+
+    def test_tcon_text_bound_invalid_json_reset_and_recovery(self):
+        decoder = FrameDecoder(text_status=True)
+        self.assertFalse(decoder.feed(b'x'*20000))
+        self.assertLessEqual(len(decoder.text_buffer), 8192)
+        self.assertFalse(decoder.feed(b'\n{broken}\n{"ready":true}\n'))
+        self.assertEqual(len(decoder.feed(self.tcon_line())), 1)
+        decoder.feed(self.tcon_line()[:70]); decoder.reset()
+        self.assertEqual(len(decoder.feed(self.tcon_line())), 1)
+        self.assertFalse(FrameDecoder().feed(self.tcon_line()))
+
     def test_every_single_split(self):
         packet = encode_frame(FILE, 7, file_payload("照片.jpg", b"abc\x00\xff"))
         for split in range(len(packet) + 1):

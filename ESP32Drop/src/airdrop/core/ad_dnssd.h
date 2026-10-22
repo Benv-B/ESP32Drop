@@ -140,6 +140,7 @@ static bool ad_dns_name_ok(const uint8_t *m, int mlen, int p) {
 struct AdDnssdOwn {
   const char *instance;
   const char *device_name;
+  bool pairing_enabled;  /* only claim services that have an implemented listener */
 };
 
 /* The four service names we answer a PTR browse for, paired with which of the two
@@ -194,6 +195,7 @@ static bool ad_dnssd_known_answer_suppresses(const uint8_t *m, int mlen,
     if (t != AD_DNS_T_PTR && t != AD_DNS_T_ANY) continue;
 
     for (int k = 0; k < AD_DNSSD_NPTR; k++) {
+      if (AD_DNSSD_PTRS[k].label == 1 && !own->pairing_enabled) continue;
       if (!ad_dns_name_eq(m, mlen, q_off[i], AD_DNSSD_PTRS[k].service)) continue;
       answerable++;
       /* Is OUR answer to this question already in the Known-Answer list? */
@@ -262,17 +264,19 @@ static bool ad_dnssd_asks_us(const uint8_t *m, int mlen, const struct AdDnssdOwn
 
     /* A browse for one of the services we advertise. */
     if (t == AD_DNS_T_PTR || t == AD_DNS_T_ANY)
-      for (int k = 0; k < AD_DNSSD_NPTR; k++)
+      for (int k = 0; k < AD_DNSSD_NPTR; k++) {
+        if (AD_DNSSD_PTRS[k].label == 1 && !own->pairing_enabled) continue;
         if (ad_dns_name_eq(m, mlen, name, AD_DNSSD_PTRS[k].service)) return true;
+      }
 
     /* Our own names, at any type. A question for a type we lack is still ours to
        answer: the response carries NSEC records saying so, and without them iOS
        re-queries forever (which is why they are in the message at all). */
     if (ad_dns_name_eq2(m, mlen, name, own->instance, "_airdrop._tcp.local")) return true;
     if (ad_dns_name_eq2(m, mlen, name, own->instance, "local")) return true;
-    if (ad_dns_name_eq2(m, mlen, name, own->device_name,
+    if (own->pairing_enabled && ad_dns_name_eq2(m, mlen, name, own->device_name,
                         "_applicationServicePairing._tcp.local")) return true;
-    if (ad_dns_name_eq2(m, mlen, name, own->device_name,
+    if (own->pairing_enabled && ad_dns_name_eq2(m, mlen, name, own->device_name,
                         "_appSvcPrePair._tcp.local")) return true;
   }
   return false;

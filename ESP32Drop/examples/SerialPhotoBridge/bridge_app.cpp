@@ -1,3 +1,4 @@
+#if !defined(PHOTO_FRAME_TCON) && !defined(PHOTO_FRAME_RX_BENCH)
 #include <Arduino.h>
 #include <ESP32AWDL.h>
 #include <ESP32Drop.h>
@@ -307,7 +308,7 @@ static void send_status() {
       "\"have_master\":%s,\"locked\":%s,\"peers\":%ld,\"mif_sent\":%lu,"
       "\"query_seen\":%lu,\"tcp_accept\":%lu,\"tls_ok\":%lu,\"discover_ok\":%lu,"
       "\"ask_ok\":%lu,\"upload_ok\":%lu,\"rx_active\":%s,\"rx_bytes\":%lu,"
-      "\"rx_max\":%lu,\"forwarded\":%lu,\"file_errors\":%lu,\"boot_error\":\"%s\","
+      "\"rx_max\":%lu,\"archive_cap\":%lu,\"forwarded\":%lu,\"file_errors\":%lu,\"boot_error\":\"%s\","
       "\"tls_alg\":\"%s\",\"internal_largest\":%lu,\"resp_tx\":%lu,"
       "\"notus\":%lu,\"ka_suppress\":%lu,\"syn_airdrop\":%lu,\"tcp_tous\":%lu,"
       "\"tx_now_errors\":%lu,\"tx_now_last_err\":%ld,\"mif_tx_errors\":%lu,"
@@ -339,7 +340,8 @@ static void send_status() {
       (unsigned long)awdl.mif_sent, (unsigned long)ad.query_seen,
       (unsigned long)ad.tcp_accept, (unsigned long)ad.tls_ok, (unsigned long)ad.discover_ok,
       (unsigned long)ad.ask_ok, (unsigned long)ad.upload_ok, ad.rx_active ? "true" : "false",
-      (unsigned long)ad.rx_bytes, (unsigned long)ad.rx_max, (unsigned long)forwarded,
+      (unsigned long)ad.rx_bytes, (unsigned long)ad.rx_max, (unsigned long)RECEIVE_CAP,
+      (unsigned long)forwarded,
       (unsigned long)ad.file_err, boot_error, ad.tls_alg ? ad.tls_alg : "none",
       (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
       (unsigned long)ad.resp_tx, (unsigned long)ad.notus, (unsigned long)ad.ka_suppress,
@@ -477,3 +479,4 @@ void bridge_loop() {
   // Drain accumulated records promptly; keep idle polling inexpensive.
   delay((forwarded_live || frame_is_off()) ? 1 : 10);
 }
+#endif // legacy USB photo consumer

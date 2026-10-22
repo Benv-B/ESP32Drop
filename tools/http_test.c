@@ -160,6 +160,28 @@ int main(void) {
     check("  ...and consumed==0 so the cause is nameable", r.consumed == 0, NULL);
   }
 
+  /* A fixed-length request cannot be complete just because a read stopped at
+     the start of a 512-byte discard block. Exercise both EOF and silence. */
+  for (int eof = 0; eof <= 1; ++eof) {
+    for (int prefix = 0; prefix <= 512; prefix += 512) {
+      unsigned char bytes[512]; memset(bytes, 'x', sizeof bytes);
+      Script s = {0}; s.close_at_end = eof != 0;
+      if (prefix) script_add(&s, 0, bytes, prefix);
+      struct HttpRdr r; http_rdr_init(&r, &s, script_read);
+      bool ok = http_drain_body(&r, false, 1024);
+      check("fixed body missing at discard boundary is incomplete and poisoned",
+            !ok && r.poisoned && r.consumed == (uint32_t)prefix &&
+            (eof ? r.eof : (r.timed_out && s.now_ms == 3000)), NULL);
+    }
+  }
+  {
+    unsigned char bytes[1028]; memset(bytes, 'x', sizeof bytes);
+    Script s = {0}; script_add(&s, 0, bytes, sizeof bytes);
+    struct HttpRdr r; http_rdr_init(&r, &s, script_read);
+    check("fixed body drains exactly its declared length, leaving next bytes",
+          http_drain_body(&r, false, 1024) && !r.poisoned && r.consumed == 1024 && r.n-r.p == 4, NULL);
+  }
+
   /* --- 2. a partial line at a timeout must poison, not masquerade as complete */
   {
     static const char part[] = "1F7B";              /* no CRLF, then silence */

@@ -6,7 +6,7 @@
 // Same contract as awdl_http.h: dependency-free integer C over the abstract
 // HttpRdr, so the SAME code compiles into the firmware and into a host test
 // (tools/test-serve.sh) that scripts both the bytes and their arrival times. The
-// budgets in here (10000 / 800 / 3000 / 400 / 300+1500) each encode a measured
+// budgets in here (10000 / 3000 / 300+1500) each encode a measured
 // failure; the comments at each site say which. Do not retune one without a test.
 //
 // What stays OUT of this file, on purpose:
@@ -64,14 +64,27 @@ struct HttpServe {
   bool ask_keep_alive;           // opt-in: frame /Ask body, then allow /Upload on this TLS stream
 };
 
-static void http_send_response(struct HttpServe *sv, const char *status,
+static bool http_send_response(struct HttpServe *sv, const char *status,
                                const unsigned char *body, int blen, bool close_it) {
   char h[192];
   int hl = snprintf(h, sizeof(h),
     "HTTP/1.1 %s\r\nContent-Type: application/octet-stream\r\nContent-Length: %d\r\n%s\r\n",
     status, blen, close_it ? "Connection: close\r\n" : "");
-  sv->write(sv, (const unsigned char *)h, hl);
-  if (body && blen) sv->write(sv, body, blen);
+  int written = sv->write(sv, (const unsigned char *)h, hl);
+  if (written != hl) {
+    snprintf(h, sizeof(h), "response_write_failed status=%s part=headers result=%d", status, written);
+    sv->log(sv, h);
+    return false;
+  }
+  if (body && blen) {
+    written = sv->write(sv, body, blen);
+    if (written != blen) {
+      snprintf(h, sizeof(h), "response_write_failed status=%s part=body result=%d", status, written);
+      sv->log(sv, h);
+      return false;
+    }
+  }
+  return true;
 }
 
 #define SV_LOG(sv, ...) do { \
@@ -98,11 +111,16 @@ static void serve_http_run(struct HttpServe *sv) {
     //    measured regression (`http_idle_end served=0 waited_ms=3001 why=timeout`
     //    while the sender's compound latency ran to ~4s). v25 used a flat 10000ms
     //    here and worked. So 10000ms.
-    //  - AFTER serving: the task is deaf to accept() while it waits, so it must
-    //    give up fast. (`served > 0` is unreachable today -- every handler below
-    //    closes -- but the branch is kept so a future keep-alive handler cannot
-    //    silently inherit the wrong budget.)
-    sv->set_timeout(r, served ? 800 : 10000);
+    //  - AFTER serving: reachable, and on the C5 build it IS the /Ask -> /Upload
+    //    pair on one TLS stream (ask_keep_alive). The task is deaf to accept()
+    //    while it waits, so this must not be a long budget -- but it must outlast
+    //    one AW cycle (1,048,576 us) plus one retransmit. 800ms did not: a request
+    //    line split across two segments a second apart arrived as a partial line,
+    //    which hr_line() correctly poisons and the DESYNC detector then reports as
+    //    a stream that was never out of frame. 3000ms is three windows, which
+    //    covers one lost segment, and still gives up well before the 10s first
+    //    read would.
+    sv->set_timeout(r, served ? 3000 : 10000);
     int L = hr_line(r, reqline, sizeof(reqline));     // request line
     if (L <= 0) { SV_LOG(sv, "http_idle_end served=%d waited_ms=%lu why=%s", served,
                          (unsigned long)(sv->now(sv) - sv->enter_ms),
@@ -156,7 +174,10 @@ static void serve_http_run(struct HttpServe *sv) {
 
     if (expect100) {
       const char *c = "HTTP/1.1 100 Continue\r\n\r\n";
-      sv->write(sv, (const unsigned char *)c, (int)strlen(c));
+      if (sv->write(sv, (const unsigned char *)c, (int)strlen(c)) != (int)strlen(c)) {
+        SV_LOG(sv, "response_write_failed status=100 Continue");
+        break;
+      }
     }
 
     if (is_up) {
@@ -203,13 +224,18 @@ static void serve_http_run(struct HttpServe *sv) {
       // gained by waiting for it, and by the time we answered the sender had given
       // up and torn the connection down. Now: respond, then make a brief best-effort
       // attempt to consume the body so the close is graceful rather than a RST.
-      http_send_response(sv, "200 OK", sv->disc_body, sv->disc_len, true);
+      if (!http_send_response(sv, "200 OK", sv->disc_body, sv->disc_len, true)) break;
       (*sv->disc_ok)++;
       *sv->disc_ms = sv->now(sv);
       SV_LOG(sv, "disc_sent n=%lu ms_since_req=%lu -- tile should appear now",
              (unsigned long)*sv->disc_ok, (unsigned long)(sv->now(sv) - t_req));
-      sv->set_timeout(r, 400);
-      http_drain_body(r, chunked, clen);
+      // A body segment can arrive in the next 1.048576 s AW cycle, with one
+      // additional cycle lost to retransmission. 400 ms closed the connection
+      // before either could arrive. Reply immediately as above, then allow the
+      // same three-cycle read budget used for subsequent request headers.
+      sv->set_timeout(r, 3000);
+      const bool drained = http_drain_body(r, chunked, clen);
+      SV_LOG(sv, "disc_drain complete=%d eof=%d timeout=%d", drained, r->eof, r->timed_out);
       break;                            // one-shot: close and get back to accept()
     }
 
@@ -229,7 +255,7 @@ static void serve_http_run(struct HttpServe *sv) {
         }
 #endif
         SV_LOG(sv, "ask_body_complete; accepting request");
-        http_send_response(sv, "200 OK", sv->ask_body, sv->ask_len, false);
+        if (!http_send_response(sv, "200 OK", sv->ask_body, sv->ask_len, false)) break;
         *sv->ask_ms = sv->now(sv);
         (*sv->ask_ok)++;
         if (sv->on_ask_sent) sv->on_ask_sent(sv);
@@ -273,7 +299,7 @@ static void serve_http_run(struct HttpServe *sv) {
       // and the close arrived one cycle later, sharingd had already entered its
       // transfer phase and treated it as a mid-transfer failure, with no retry (v27,
       // "Receiving 0kB" forever). So: Connection: close in the response header.
-      http_send_response(sv, "200 OK", sv->ask_body, sv->ask_len, true);
+      if (!http_send_response(sv, "200 OK", sv->ask_body, sv->ask_len, true)) break;
       *sv->ask_ms = sv->now(sv);
       (*sv->ask_ok)++;
       if (sv->on_ask_sent) sv->on_ask_sent(sv);   // firmware: flip to "Receiving" UI

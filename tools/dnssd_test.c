@@ -25,7 +25,7 @@ static void check(const char *name, int ok, const char *detail) {
   if (!ok) fails++;
 }
 
-static const struct AdDnssdOwn OWN = { "2a848543b30c", "M5 Badge" };
+static const struct AdDnssdOwn OWN = { "2a848543b30c", "M5 Badge", true };
 
 enum { AD_Q_ALL_KNOWN, AD_Q_SOME_KNOWN, AD_Q_NONE_KNOWN, AD_Q_NOT_OURS };
 static const char *CLASSNAME[] = { "ALL_KNOWN", "SOME_KNOWN", "NONE_KNOWN", "NOT_OURS" };
@@ -346,6 +346,22 @@ int main(void) {
           ad_dnssd_asks_us(B, bn, &OWN), NULL);
   }
 
+  {
+    struct AdDnssdOwn legacy = OWN;
+    legacy.pairing_enabled = false;
+    b_reset(1, 0); b_question("_appSvcPrePair._tcp.local", AD_DNS_T_PTR);
+    check("disabled pairing browse is not a service we offer", !ad_dnssd_asks_us(B,bn,&legacy), NULL);
+    b_reset(1, 0); b_question("M5 Badge._applicationServicePairing._tcp.local", AD_DNS_T_TXT);
+    check("disabled pairing identity is not ours to advertise", !ad_dnssd_asks_us(B,bn,&legacy), NULL);
+    b_reset(1, 1); b_question("_appSvcPrePair._tcp.local", AD_DNS_T_PTR);
+    b_ptr("_appSvcPrePair._tcp.local", "M5 Badge._appSvcPrePair._tcp.local", AD_DNSSD_PTR_TTL);
+    check("retired known answer cannot count as a live service", !ad_dnssd_known_answer_suppresses(B,bn,&legacy), NULL);
+    b_reset(1, 0); b_question("_airdrop._tcp.local", AD_DNS_T_PTR);
+    check("real AirDrop browse remains answerable", ad_dnssd_asks_us(B,bn,&legacy), NULL);
+    b_reset(1, 1); b_question("_airdrop._tcp.local", AD_DNS_T_PTR);
+    b_ptr("_airdrop._tcp.local", "2a848543b30c._airdrop._tcp.local", AD_DNSSD_PTR_TTL);
+    check("real AirDrop known-answer suppression is retained", ad_dnssd_known_answer_suppresses(B,bn,&legacy), NULL);
+  }
   printf("\n%d checks, %d failed\n", ran, fails);
   return fails ? 1 : 0;
 }

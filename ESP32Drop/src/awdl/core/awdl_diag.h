@@ -157,6 +157,8 @@ struct AwdlDiag {
 
   /* --- folded in from the objects that own them, in awdl_diag_read() ---------------- */
   volatile uint32_t ring_drop;        /* frames the RX ring had nowhere to put */
+  volatile uint32_t rx_ring_capacity, rx_ring_peak; /* usable slots; sampled peak */
+  volatile uint32_t rx_queue_us_max;  /* callback entry to processing, since begin */
   volatile uint32_t dump_drop;        /* staged captures dropped, ring full */
   volatile uint32_t pll_relock, pll_out;   /* hard re-seeds; rejected innovations */
 

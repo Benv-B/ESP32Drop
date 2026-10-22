@@ -109,18 +109,12 @@ static volatile uint16_t g_syn_other_port = 0;
  * link layer refuses to perform anywhere but inside this tap.
  * ========================================================================== */
 
-/* The display name the two pairing services advertise. ONE definition: the encoder below
- * writes it into the PTR/SRV/TXT it emits, and ad_dnssd_known_answer_suppresses() compares
- * against it to decide whether a peer already holds that record. If those two ever
- * disagreed we would suppress a record we do not actually send, and go silently
- * undiscoverable -- the failure this whole area is built to avoid.
- *
- * ⚠️ It is a compile-time constant, and AirDrop.begin("name") cannot yet change it: what
- * the iPhone's share sheet actually DISPLAYS has never been measured, so nothing is
- * promised about it. */
+/* Exact old pairing identity, retained only to withdraw cached records. The real
+ * receiver name comes from /Discover. Neither pairing port has an implementation. */
 #define AIRDROP_DNM "M5 Badge"
 
 static struct AwdlIdentity g_id;      /* filled once, at ad_begin() */
+static uint32_t g_ad_started_ms;
 
 /* --- the two responses that carry our identity ------------------------------------
  *
@@ -200,15 +194,9 @@ static uint16_t udp6_checksum(const uint8_t *src, const uint8_t *dst,
   return ck ? ck : 0xffff;
 }
 
-// Emit one modern-AirDrop "pairing" service (PTR + SRV + TXT), matching the shape
-// a real Mac's sharingd advertises for _applicationServicePairing._tcp /
-// _appSvcPrePair._tcp. On the current macOS/iOS stack sharingd carries the AirDrop
-// identity (sn/at/sid/dnm) through these services and appears to require them (plus
-// possibly a BLE pre-pair) before it will open the /Discover connection to a peer.
-// This is the diagnostic experiment: if adding these makes sharingd send us a TCP
-// SYN, the missing identity surface was the gate; if not, BLE pre-pair is mandatory.
-// svc = e.g. "_applicationServicePairing._tcp.local"; host has the AAAA already.
-static uint8_t *put_pair_service(uint8_t *p, const char *svc, uint16_t port,
+// RFC 6762 10.1: withdraw the exact old PTR/SRV/TXT rdata with TTL zero. Advertising
+// these unimplemented ports invited connection attempts that lwIP could only reset.
+static uint8_t *put_pair_goodbye(uint8_t *p, const char *svc, uint16_t port,
                                  const char *host) {
   const char *DNM = AIRDROP_DNM;
   char inst[80];
@@ -217,13 +205,13 @@ static uint8_t *put_pair_service(uint8_t *p, const char *svc, uint16_t port,
   // PTR: svc -> inst (shared record, no cache-flush)
   p = put_dnsname(p, svc);
   *p++ = 0; *p++ = 12; *p++ = 0x00; *p++ = 0x01;      // PTR, class IN
-  *p++ = 0; *p++ = 0; *p++ = 0x11; *p++ = 0x94;       // TTL 4500
+  *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0;             // goodbye TTL 0
   rl = p; p += 2; rs = p; p = put_dnsname(p, inst);
   { uint16_t n = p - rs; rl[0] = n >> 8; rl[1] = n; }
   // SRV: inst -> host:port
   p = put_dnsname(p, inst);
   *p++ = 0; *p++ = 33; *p++ = 0x80; *p++ = 0x01;      // SRV, class IN flush
-  *p++ = 0; *p++ = 0; *p++ = 0x00; *p++ = 0x78;       // TTL 120
+  *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0;             // goodbye TTL 0
   rl = p; p += 2; rs = p;
   *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0;             // priority, weight
   *p++ = port >> 8; *p++ = port & 0xff;
@@ -232,7 +220,7 @@ static uint8_t *put_pair_service(uint8_t *p, const char *svc, uint16_t port,
   // TXT: inst -> sn / at / sid / dnm
   p = put_dnsname(p, inst);
   *p++ = 0; *p++ = 16; *p++ = 0x80; *p++ = 0x01;      // TXT, class IN flush
-  *p++ = 0; *p++ = 0; *p++ = 0x00; *p++ = 0x78;
+  *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0;             // goodbye TTL 0
   rl = p; p += 2; rs = p;
   char at[24], sid[64], dnm[24];
   snprintf(at, sizeof(at), "at=%s", g_id.instance);       // 12-hex identity tag
@@ -247,13 +235,12 @@ static uint8_t *put_pair_service(uint8_t *p, const char *svc, uint16_t port,
 }
 
 // Build the DNS message (mDNS authoritative answer advertising our service).
-static int build_mdns_msg(uint8_t *d) {
+static int build_mdns_msg(uint8_t *d, bool retire_pairing) {
   uint8_t *p = d;
   *p++ = 0; *p++ = 0;              // id
   *p++ = 0x84; *p++ = 0x00;        // flags: response + authoritative
   *p++ = 0; *p++ = 0;              // qdcount
-  *p++ = 0; *p++ = 12;             // ancount = 12 (_airdrop: PTR,SRV,TXT,AAAA,2xNSEC
-                                   //   + 2 pairing services x (PTR,SRV,TXT))
+  *p++ = 0; *p++ = retire_pairing ? 12 : 6; // 6 live records + optional 6 goodbyes
   *p++ = 0; *p++ = 0;              // nscount
   *p++ = 0; *p++ = 0;              // arcount
   char inst[48], host[24];
@@ -306,12 +293,10 @@ static int build_mdns_msg(uint8_t *d) {
   p = put_dnsname(p, inst);
   *p++ = 0x00; *p++ = 0x05; *p++ = 0x00; *p++ = 0x00; *p++ = 0x80; *p++ = 0x00; *p++ = 0x40;
   { uint16_t n = p - rs; rl[0] = n >> 8; rl[1] = n; }
-  // Modern-AirDrop identity surface: advertise the two pairing services so
-  // sharingd (which queries these alongside _airdrop and carries its own identity
-  // only through them) has an identity to promote us from "discovered" to a
-  // /Discover connection. Both target our existing host (its AAAA is above).
-  p = put_pair_service(p, "_applicationServicePairing._tcp.local", 54763, host);
-  p = put_pair_service(p, "_appSvcPrePair._tcp.local", 54764, host);
+  if (retire_pairing) {
+    p = put_pair_goodbye(p, "_applicationServicePairing._tcp.local", 54763, host);
+    p = put_pair_goodbye(p, "_appSvcPrePair._tcp.local", 54764, host);
+  }
   return p - d;
 }
 
@@ -326,7 +311,9 @@ static int build_mdns_ip6(uint8_t *frame) {
   uint8_t *buf = frame + AWDL_TX_HEADROOM;
   static const uint8_t mip[16] = {0xff,0x02,0,0,0,0,0,0,0,0,0,0,0,0,0,0xfb};
   uint8_t dns[1280];               /* _airdrop(391) + 2 pairing services(~630) */
-  int dlen   = build_mdns_msg(dns);
+  // Migration grace: send old-record goodbyes during the first two minutes, then
+  // use the smaller normal announcement. A goodbye is not an available service.
+  int dlen   = build_mdns_msg(dns, (uint32_t)(millis() - g_ad_started_ms) < 120000u);
   int udplen = 8 + dlen;
 
   uint8_t *p = buf;
@@ -445,7 +432,7 @@ static void ad_rx_tap(void *, const uint8_t src[6], const uint8_t *ip6, size_t i
           // parse, a name that will not resolve, a question count we cannot walk -- all of
           // them reply exactly as the old filter did. Only a query fully parsed, in which
           // no question names a record we hold, is dropped.
-          struct AdDnssdOwn own = { g_id.instance, AIRDROP_DNM };
+          struct AdDnssdOwn own = { g_id.instance, AIRDROP_DNM, false };
           if (!ad_dnssd_asks_us(dns, dns_len, &own))                     { ka_dec = 2; g_notus++; }
           else if (ad_dnssd_known_answer_suppresses(dns, dns_len, &own)) { ka_dec = 1; g_ka_suppress++; }
           else                            { ka_dec = 0; ad_respond(src); }
@@ -478,13 +465,8 @@ static void ad_rx_tap(void *, const uint8_t src[6], const uint8_t *ip6, size_t i
       g_tcp_tous++;
       uint8_t flags = iplen >= 54 ? ip6[40 + 13] : 0;  // TCP flags byte
       uint16_t dport = (ip6[42] << 8) | ip6[43];
-      // Which of our ADVERTISED ports does the sender actually dial? We publish three
-      // in mDNS -- _airdrop._tcp on 8770, _applicationServicePairing._tcp on 54763 and
-      // _appSvcPrePair._tcp on 54764 -- but bind() only 8770, so a connection to
-      // either pairing port gets a RST from lwIP. Earlier notes credited those pairing
-      // records with the discovery-to-connection promotion, which may well be the
-      // identity TXT they carry rather than the ports; this counts SYNs per port so
-      // the question is answered by observation before anything is changed.
+      // Only 8770 is advertised now. Keep counting the retired pairing ports to
+      // distinguish stale cache attempts from a connection to the working listener.
       if (flags & 0x02) {                            // SYN
         if      (dport == 8770)  g_syn_airdrop++;
         else if (dport == 54763) g_syn_pair1++;
@@ -1268,7 +1250,16 @@ static void rx_upload(struct HttpRdr *r, bool chunked, int clen) {
     // DvZip stream. 3000ms because measured stalls on this link are 3004ms and
     // 4104ms and a shorter settle would answer 200 OK on a truncated body whose
     // DvZip prefix still decompresses -- a corrupt image reported as a success.
-    int rc = http_recv_chunked(r, &sk, 10000, 3000, http_set_timeout);
+    // TCON previews run concurrently with this upload on the single-core C5.
+    // A measured preview upload hit the old 10 s TLS read timeout mid-body.
+    // Allow bounded recovery of a stalled receive; completeness still requires
+    // the HTTP/DvZip end and the consumer's validated COMMIT below.
+#ifdef PHOTO_FRAME_TCON
+    constexpr uint32_t upload_body_wait_ms = 30000;
+#else
+    constexpr uint32_t upload_body_wait_ms = 10000;
+#endif
+    int rc = http_recv_chunked(r, &sk, upload_body_wait_ms, 3000, http_set_timeout);
     gz = sk.buf; cap = sk.cap; len = sk.len;   /* len: whole body (RAW) or residue (STREAM) */
     body_total = (pump.mode == RXM_STREAM) ? pump.in_total : len;
     g_rx_bytes = body_total;
@@ -1327,7 +1318,7 @@ static void rx_upload(struct HttpRdr *r, bool chunked, int clen) {
       receipt_error = "archive truncated or empty";
     else if (g_stream_req && !stream_send(AD_STREAM_COMMIT, pump.stream_id, pump.out_len,
                                         nullptr, 0, pump.stream_crc))
-      receipt_error = "consumer did not commit archive";
+      receipt_error = g_stream_error_message[0] ? g_stream_error_message : "consumer did not commit archive";
   }
 
   {  /* Reply only after complete HTTP/DvZip receipt. Streaming also requires the
@@ -1339,18 +1330,22 @@ static void rx_upload(struct HttpRdr *r, bool chunked, int clen) {
     /* INFLATE is judged first: aborting a receive mid-body (the sink's max=0 clamp)
        surfaces as OVERFLOW too, and the record that would not inflate is the truer
        fact than the abort it caused. */
-    if (pump.fail == RXF_CONSUMER)         status = "502 Bad Gateway";
+    if (pump.fail == RXF_CONSUMER)         status = ad_stream_error_http(g_stream_error);
     else if (pump.fail == RXF_FORMAT)      status = "415 Unsupported Media Type";
     else if (pump.fail == RXF_INFLATE)     status = "400 Bad Request";
     else if (overflow)                     status = g_rx_grow_failed ? "507 Insufficient Storage"
                                                                      : "413 Content Too Large";
     else if (body_total < 6)               status = "400 Bad Request";
+    else if (receipt_error && g_stream_req && clean_end && ad_dvzip_end_ok(pump.end))
+                                          status = ad_stream_error_http(g_stream_error);
     else if (receipt_error)                status = r->timed_out && !clean_end
                                                    ? "408 Request Timeout" : "400 Bad Request";
     char h[128];
     int hl = snprintf(h, sizeof(h),
                       "HTTP/1.1 %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", status);
-    ssl_write_all(ssl, (const unsigned char *)h, hl);
+    EV("upload_reply_begin id=%lu status=%s total=%lu",(unsigned long)pump.stream_id,status,(unsigned long)body_total);
+    const int reply_result=ssl_write_all(ssl, (const unsigned char *)h, hl);
+    EV("upload_reply_end id=%lu wrote=%d expected=%d",(unsigned long)pump.stream_id,reply_result,hl);
     if (status[0] != '2') {
       /* DO NOT CLOSE ON TOP OF THE STATUS WE JUST WROTE.
        *
@@ -1387,7 +1382,9 @@ static void rx_upload(struct HttpRdr *r, bool chunked, int clen) {
   AD_LOG("UPLOAD: received %lu bytes (chunk=%d ovf=%d complete=%d)\n",
                 (unsigned long)body_total, chunked, overflow, clean_end);
   if (pump.fail == RXF_CONSUMER || pump.fail == RXF_FORMAT) {
-    strlcpy(g_img_errmsg, pump.fail == RXF_CONSUMER ? "output chunk not acknowledged" : "stream requires chunked DvZip", sizeof(g_img_errmsg));
+    strlcpy(g_img_errmsg, pump.fail == RXF_CONSUMER
+      ? (g_stream_error_message[0] ? g_stream_error_message : "output chunk not acknowledged")
+      : "stream requires chunked DvZip", sizeof(g_img_errmsg));
     g_img_err++; goto done;
   }
   if (pump.fail == RXF_INFLATE) {          /* before overflow, same order as the status */
@@ -1396,8 +1393,14 @@ static void rx_upload(struct HttpRdr *r, bool chunked, int clen) {
     g_img_err++; goto done;
   }
   if (overflow) {
-    strlcpy(g_img_errmsg, g_rx_grow_failed ? "out of PSRAM" : "file too large",
-            sizeof(g_img_errmsg));
+    /* NAME THE LIMIT, not just the verdict. "file too large" told a user nothing about
+     * which photo would have fitted, and the number is the one thing they can act on
+     * (downscale, or raise max_receive in ad_begin()). g_rx_max is the DECODED archive
+     * ceiling in force for this transfer; the sender's file is a few hundred bytes
+     * smaller than that because of the cpio wrapper. */
+    if (g_rx_grow_failed) strlcpy(g_img_errmsg, "out of PSRAM", sizeof(g_img_errmsg));
+    else snprintf(g_img_errmsg, sizeof(g_img_errmsg), "file over %lu MiB cap",
+                  (unsigned long)((g_rx_max + 1048575u) / 1048576u));
     g_img_err++; goto done;
   }
   if (body_total < 6) { strlcpy(g_img_errmsg, "empty body", sizeof(g_img_errmsg)); g_img_err++; goto done; }
@@ -1408,7 +1411,7 @@ static void rx_upload(struct HttpRdr *r, bool chunked, int clen) {
 
   if (g_stream_req) {
     g_files_ok += g_stream_files; g_upload_ok++;
-    AD_LOG("UPLOAD-SAVED: %lu decoded bytes, %lu files on computer\n",
+    AD_LOG("UPLOAD-COMMITTED: %lu decoded bytes, %lu files accepted by consumer\n",
            (unsigned long)pump.out_len, (unsigned long)g_stream_files);
     goto done;
   }
@@ -1520,10 +1523,13 @@ static void rx_upload(struct HttpRdr *r, bool chunked, int clen) {
         if (pump.fail) {
           preview_publish(nullptr, 0, 3);
           heap_caps_free(pump.out); pump.out = nullptr;
-          strlcpy(g_img_errmsg, pump.fail == RXF_INFLATE ? "dvzip inflate failed"
-                              : pump.fail == RXF_OOM     ? "out of PSRAM"
-                                                         : "file too large",
-                  sizeof(g_img_errmsg));
+          if (pump.fail == RXF_INFLATE) strlcpy(g_img_errmsg, "dvzip inflate failed",
+                                                sizeof(g_img_errmsg));
+          else if (pump.fail == RXF_OOM) strlcpy(g_img_errmsg, "out of PSRAM",
+                                                 sizeof(g_img_errmsg));
+          else snprintf(g_img_errmsg, sizeof(g_img_errmsg), "file over %lu MiB cap",
+                        (unsigned long)(((pump.psram_limited ? pump.out_cap : g_rx_max)
+                                         + 1048575u) / 1048576u));
           g_img_err++; goto done;
         }
         if (pump.out_len && !g_preview_mutex) {
@@ -2062,6 +2068,7 @@ int ad_begin(const char *name, uint32_t max_receive) {
   /* AWDL must already be up: the identity below is derived from the interface MAC, and
      the mDNS records we are about to advertise are built out of it. */
   awdl_identity(&g_id);
+  g_ad_started_ms = millis();
   awdl_rx_tap_set(ad_rx_tap, nullptr);
 #if CONFIG_IDF_TARGET_ESP32C5
   awdl_set_announce_cb(ad_announce_peer, nullptr);

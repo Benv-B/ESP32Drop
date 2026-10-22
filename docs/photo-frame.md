@@ -1,5 +1,7 @@
 # XIAO ESP32-C5 RevC 相框：NFC 唤醒、AirDrop、USB 预览
 
+> 本页记录历史 USB 预览版本。当前 `tools/build-photo-frame.ps1` 已改为真实 TCON 输出；使用方法见 [IRIS 实屏说明](iris-tcon.md)。本页下文的“当前板上固件”、构建参数与 USB 实测仅指当时记录，不能作为新固件已烧录或实屏已通过的证据。若需要复现旧版本，使用 `build-serial-bridge.ps1 -Board C5 -Channel 149 -Country CN -RevC -DisableIris`。
+
 接收名称：**Photo Frame**。当前板上固件为 `xiao-c5-frame-noiris-2`，保留静态照片能力协商，并增加 USB 逻辑关机后的快速 NFC 检测和准确的重启原因记录。普通整合版构建为 `xiao-c5-frame-usb-2`。历史实测版本与当前版本分别记录在下文。
 
 ## 使用
@@ -46,7 +48,7 @@ NFC 不负责传图片，也不会自动替用户在照片里选图或点击 Air
 
 ## 软件保证与边界
 
-C5 分块解包上限为 128 MiB，不需要把整个照片包放进 PSRAM。电脑先校验、落盘原件并确认，ESP 才完成 AirDrop 成功回复。断线、CRC 错误、保存失败都不能伪装成功；断线不保证自动恢复，手机报失败后需重发。合成测试文件在页面有明确标记。
+C5 分块解包上限分两种构建：USB 桥接版为 128 MiB（逐块转发给电脑，板上不保留整包）；TCON 实屏版必须整包保留以完成 CRC、cpio 校验和 JPEG 解码，上限是 `iris_archive.h` 的 `ARCHIVE_CAP`（4 MiB，约合一张不超过 4 MiB 的 JPEG），超出返回 413，并在状态中报 `file over 4 MiB cap`；HEIC、多选和实况视频在提交阶段被拒绝。电脑先校验、落盘原件并确认，ESP 才完成 AirDrop 成功回复。断线、CRC 错误、保存失败都不能伪装成功；断线不保证自动恢复，手机报失败后需重发。合成测试文件在页面有明确标记。
 
 关机先原子关闭新 TLS 会话入口，等待现有 TLS 会话（包含最后 HTTP 回复）及合成流任务结束、待交付文件清空，再停 AWDL。NFC 读数必须有效且连续至少 500 ms 不在场；读取失败或过期会阻止关机。PWR_OFF 只在外层主循环执行，不会在处理文件 ACK 的内层循环中切断电源。
 

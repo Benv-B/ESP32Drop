@@ -4,11 +4,11 @@
 <style>
 :root{color-scheme:dark;font-family:system-ui,"Microsoft YaHei",sans-serif;background:#10141e;color:#e9edf6}body{max-width:1100px;margin:36px auto;padding:0 22px}h1{margin-bottom:8px}.sub{color:#99a7bd}section{background:#1a2130;border:1px solid #303b51;border-radius:14px;padding:20px;margin:20px 0}.stats{display:flex;flex-wrap:wrap;gap:20px}.pill{color:#82dab5}button,a{background:#344c77;color:white;border:0;border-radius:8px;padding:10px 16px;cursor:pointer;text-decoration:none}button:disabled{opacity:.5;cursor:wait}#gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:18px}.card{background:#1a2130;border:1px solid #303b51;border-radius:12px;overflow:hidden}.card img{width:100%;height:240px;object-fit:contain;background:#090c13}.card .info{padding:16px}.card h3{overflow-wrap:anywhere;margin:0 0 8px}.card small{display:block;color:#9aa9bf;margin-bottom:16px}.test{color:#ffcf79}pre{white-space:pre-wrap;word-break:break-word;font-size:12px;max-height:280px;overflow:auto;color:#aebbd0}#message{color:#b8c7df}#empty{color:#94a4bd;padding:24px}.error{color:#ff9b9b}
 </style></head><body>
-<h1>Photo Frame</h1><div class="sub">触碰 NFC 唤醒 → iPhone 隔空投送 → ESP32-C5 → USB 电脑预览</div>
-<section id="frame-panel" hidden><div class="stats"><strong id="frame-state"></strong><span id="frame-nfc"></span><span id="frame-timer"></span></div><p id="frame-note"></p><div class="stats"><button data-frame="wake">恢复接收 / 延长等待</button><button data-frame="hold">保持唤醒</button><button data-frame="auto">恢复自动关机</button><button data-frame="off">结束接收并关机</button></div><p class="sub">当前电脑代替屏幕：请保持 USB 和本页面服务运行。关机按钮会等待正在接收的文件完成。</p></section>
-<section><div class="stats"><strong id="connection">正在连接页面…</strong><span id="memory"></span><span id="link"></span></div><p id="message">等待开发板状态。</p><button id="test">测试板子 → 电脑显示</button><p class="sub">此按钮让板子发送一张蓝色测试图，只验证USB链路，不代表 iPhone AirDrop 已验证。</p></section>
+<h1>Photo Frame</h1><div class="sub" id="route-note">触碰 NFC 唤醒 → iPhone 隔空投送 → ESP32-C5 → USB 电脑预览</div>
+<section id="frame-panel" hidden><div class="stats"><strong id="frame-state"></strong><span id="frame-nfc"></span><span id="frame-timer"></span></div><p id="frame-note"></p><div class="stats"><button data-frame="wake">恢复接收 / 延长等待</button><button data-frame="hold">保持唤醒</button><button data-frame="auto">恢复自动关机</button><button data-frame="off">结束接收并关机</button></div><p class="sub" id="output-note">当前电脑代替屏幕：请保持 USB 和本页面服务运行。关机按钮会等待正在接收的文件完成。</p></section>
+<section><div class="stats"><strong id="connection">正在连接页面…</strong><span id="memory"></span><span id="link"></span></div><p id="message">等待开发板状态。</p><button id="test">测试板子 → 电脑显示</button><p class="sub" id="test-note">此按钮让板子发送一张蓝色测试图，只验证USB链路，不代表 iPhone AirDrop 已验证。</p></section>
 <section><strong>接收中的照片</strong><p id="live-status">等待图片数据。</p><progress id="live-progress" max="1" value="0" style="width:100%"></progress><p id="pipeline" class="sub"></p><p id="live-note" class="sub">JPEG / PNG 可尝试边接收边预览；HEIC 等格式需等完整文件。这里展示电脑解码结果，不代表 Spectra 6 的实际刷新过程。</p><img id="live-image" hidden alt="接收中的临时图片，尚未完成校验" style="width:100%;max-height:540px;object-fit:contain;background:#090c13"></section>
-<section><strong>iPhone 测试步骤</strong><ol><li>打开 Wi-Fi 和蓝牙，亮屏触碰 NFC，然后打开照片；无需 NFC Tools。</li><li>先用一张小照片或截图：照片 → 分享 → 隔空投送 → <b id="receiver-name">Photo Frame</b>。</li><li>如果设备不出现，保持分享页面打开，观察下方 AWDL、发现和 TLS 状态。</li><li>原图完整校验并保存后显示；C5 分块接收的解包文件包上限为 128 MiB。</li></ol><span class="sub">此测试接收器自动接受附近发送者，不验证 Apple 身份；请仅在可信环境使用。原图只保存到电脑，当前不执行屏幕 SPI 输出或 ESP 图像转换。</span></section>
+<section><strong>iPhone 测试步骤</strong><ol><li>打开 Wi-Fi 和蓝牙，亮屏触碰 NFC，然后打开照片；无需 NFC Tools。</li><li>先用一张小照片或截图：照片 → 分享 → 隔空投送 → <b id="receiver-name">Photo Frame</b>。</li><li>如果设备不出现，保持分享页面打开，观察下方 AWDL、发现和 TLS 状态。</li><li>原图完整校验并保存后显示；单张整包上限由固件上报（当前 <b id="archive-cap">…</b>），超过会明确拒绝。</li></ol><span class="sub" id="receiver-note">此测试接收器自动接受附近发送者，不验证 Apple 身份；请仅在可信环境使用。原图只保存到电脑，当前不执行屏幕 SPI 输出或 ESP 图像转换。</span></section>
 <div id="gallery"></div><div id="empty">还没有收到照片。</div>
 <section><strong>运行日志</strong><pre id="log"></pre><details><summary>完整开发板状态</summary><pre id="state"></pre></details></section>
 <script>
@@ -57,9 +57,19 @@ function renderFiles(files){const key=files.map(f=>f.id).join();if(key===shown)r
 async function refresh(){try{const r=await fetch('/api/state');if(!r.ok)throw Error(r.status);const s=await r.json(),b=s.board;$('connection').textContent=b.transport==='replay'?'本地限速回放 · 未使用 ESP / USB':s.connected?s.port+' 已连接 · '+(b.transport==='usb_hwcdc'?'原生 USB CDC':s.baud+' baud'):'USB未连接：'+s.port;$('connection').className=s.connected||b.transport==='replay'?'pill':'error';$('test').hidden=b.transport==='replay';$('memory').textContent=b.psram_bytes?'PSRAM '+size(b.psram_bytes)+' · 剩余 '+size(b.psram_free):'';$('link').textContent=b.ready?'AWDL '+(b.locked?'已同步':b.have_master?'同步中':'等待 iPhone')+' · 已转发 '+b.forwarded+' 个文件':'';const [done,total]=s.serial_progress;
 if(b.chip)$('memory').textContent=b.chip+' · '+$('memory').textContent;
 if(b.ready&&b.radio_channel)$('link').textContent+=(b.radio_channel>14?' · 5 GHz':' · 2.4 GHz')+' / 信道 '+(b.radio_actual_channel||b.radio_channel)+(b.radio_country?' · '+b.radio_country:'');
-$('receiver-name').textContent=b.name||'Photo Frame';renderFrame(b,s.connected);
+$('receiver-name').textContent=b.name||'Photo Frame';$('archive-cap').textContent=b.archive_cap?size(b.archive_cap):'以状态为准';renderFrame(b,s.connected);
 let msg=b.boot_error||(!b.ready?'等待板子启动 / 检查烧录与复位':'已就绪，在 iPhone 上选择 '+(b.name||'Photo Frame'));
-if(b.file_error&&!b.rx_active)msg=b.file_error==='handler refused a file'?'ESP 已收图，但向电脑交付失败；旧固件需重新投送':'上次接收未完成：'+b.file_error+'（已接收 '+size(b.rx_bytes)+'）';
+// A refusal has three very different causes and the firmware reports which one. "Send a
+// smaller photo" and "this firmware cannot take HEIC" are not the same instruction, and
+// both used to read as a bare "接收失败".
+if(b.file_error&&!b.rx_active){
+ const reason=String(b.file_error),hint=/over \d+ MiB cap/.test(reason)?'：这张照片超过整包上限 '+size(b.archive_cap||0)+'，换小一点的照片':
+  /HEIC|JPEG/i.test(reason)?'：只支持单张 JPEG（HEIC / 实况 / 多选会被拒绝）':
+  /PSRAM|memory/i.test(reason)?'：板子内存不足':'';
+ msg=reason==='handler refused a file'?'ESP 已收图，但向电脑交付失败；旧固件需重新投送':'上次接收未完成：'+reason+hint+'（已接收 '+size(b.rx_bytes)+'）';
+}else if(b.error&&!b.rx_active){
+ msg='上次接收未完成：'+b.error+'；请重新投送单张 JPEG（不超过 '+size(b.archive_cap||0)+'）';
+}
 if(b.rx_active){msg='手机 → ESP：正在接收 '+size(b.rx_bytes);if(s.live?.state==='receiving')msg+=' ｜ 已同步到电脑 '+size(s.live.archive_bytes)}
 else if(total)msg='ESP → 电脑：USB 转发 '+Math.min(100,100*done/total).toFixed(0)+'%（手机投送完成后，此步骤仍可能继续）';
 else if(s.live?.state==='verified')msg='电脑：原图校验通过，正在解码和保存';
@@ -67,7 +77,42 @@ else if(s.live?.state==='saved')msg='电脑：图片已校验并保存';
 if(b.delivery_pending&&!b.rx_active)msg='ESP 已收图，等待电脑确认保存'+(b.delivery_retries?'；已保留图片，正在重试 USB 交付':'');
 if(b.transport==='replay')msg='软件模拟：按设定速度输入数据，不能用来衡量无线或屏幕速度';
 if(b.frame?.off_requested)msg='接收已结束；点击“恢复接收”重新启动。';
-$('message').textContent=msg;$('log').textContent=s.logs.join('\n');$('log').scrollTop=$('log').scrollHeight;$('state').textContent=JSON.stringify(b,null,2);renderFiles(s.files);renderPipeline(b);renderLive(s.live||{state:"idle"},b,s.files)}catch(e){$('connection').textContent='电脑端服务不可用：'+e.message;$('connection').className='error'}}
+$('message').textContent=msg;$('log').textContent=s.logs.join('\n');$('log').scrollTop=$('log').scrollHeight;$('state').textContent=JSON.stringify(b,null,2);renderFiles(s.files);renderPipeline(b);renderLive(s.live||{state:"idle"},b,s.files);renderTcon(b,s)}catch(e){$('connection').textContent='电脑端服务不可用：'+e.message;$('connection').className='error'}}
+function renderTcon(b,s){
+ const ids=['route-note','output-note','test-note','receiver-note','empty'];
+ if(!renderTcon.original)renderTcon.original=Object.fromEntries(ids.map(id=>[id,$(id).textContent]));
+ if(b.output!=='iris_spi'){
+  if(renderTcon.active)for(const id of ids)$(id).textContent=renderTcon.original[id];
+  renderTcon.active=false;return;
+ }
+ renderTcon.active=true;
+ $('route-note').textContent='iPhone 隔空投送 → ESP32-C5 → IRIS 屏幕';
+ $('output-note').textContent='照片由开发板解码并显示，电脑仅显示状态。关机等待接收及刷新结束。';
+ $('test').hidden=true;
+ $('test-note').textContent='请从 iPhone 投送单张 JPEG；照片不经过电脑保存。';
+ $('receiver-note').textContent='实屏模式：只支持单张普通 JPEG，整包上限为 '+size(b.archive_cap)+ '，包含少量归档开销。';
+ $('live-image').hidden=true;
+ $('live-note').textContent='此处显示开发板接收与刷新阶段；实际画面请查看 IRIS 屏幕。';
+ $('empty').textContent='实屏模式不在电脑创建照片副本。';
+ const labels={waiting:'等待照片',receiving:'正在接收照片',processing:'正在解码与校验',previewing:'正在刷新分段预览',refreshing:'正在整屏刷新',displayed:'屏幕刷新完成',error:'本次未完成'};
+ const stream=b.stream||{}, n=b.network||{};
+ $('live-status').textContent=(labels[b.state]||b.state)+' · JPEG '+size(stream.jpeg_received)+' / '+size(stream.jpeg_total);
+ $('live-progress').max=Math.max(1,stream.jpeg_total||0);
+ $('live-progress').value=stream.jpeg_received||0;
+ $('pipeline').textContent='接收字节进度不等于屏幕刷新进度。已完成显示 '+(b.displayed||0)+' 张；错误 '+(b.display_errors||0)+' 次。';
+ $('link').textContent=b.ready?'AirDrop 已启动 · '+(n.locked?'无线已同步':n.have_master?'无线同步中':'等待附近设备'): '接收服务未就绪';
+ let msg=labels[b.state]||b.state;
+ const reason=b.error||b.file_error||'';
+ if(reason){
+  let hint='';
+  if(/archive (cap|limit)|over \d+ MiB/.test(reason))hint='；照片超过整包上限 '+size(b.archive_cap)+'，请缩小后再发';
+  else if(/TCON/.test(reason))hint='；屏幕驱动报告错误，详情见完整状态中的 ints';
+  else if(/JPEG|HEIC|unsupported|multiple/i.test(reason))hint='；请只发送一张普通 JPEG';
+  msg='未完成：'+reason+hint;
+ }
+ if(b.frame?.off_requested)msg='接收已结束；点击“恢复接收”重新启动。';
+ $('message').textContent=msg;
+}
 $('test').onclick=async()=>{const b=$('test');b.disabled=true;try{const r=await fetch('/api/self-test',{method:'POST'});const result=await r.json();if(!r.ok)alert(result.error||'测试请求失败')}catch(e){alert(e.message)}finally{b.disabled=false}};
 const originalRefresh=refresh;
 // Keep requests sequential even if a decode or disk operation is slow.

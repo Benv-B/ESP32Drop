@@ -9,7 +9,7 @@
 struct AwdlTransferEvent {
   uint32_t ms, seq, ack;
   int32_t result;
-  uint16_t sport, dport, size, zero_ttl;
+  uint16_t sport, dport, size, zero_ttl, window, mss;
   uint8_t peer[6], kind, flags;
   char direction;
 };
@@ -46,6 +46,17 @@ static bool awdl_trace_classify(const uint8_t *ip, size_t n,
     e->kind = 6; e->flags = p[13];
     e->sport = awdl_trace_u16(p); e->dport = awdl_trace_u16(p + 2);
     e->seq = awdl_trace_u32(p + 4); e->ack = awdl_trace_u32(p + 8);
+    e->window = awdl_trace_u16(p + 14);
+    if (e->flags & 2) {
+      for (unsigned at = 20; at < h;) {
+        const unsigned kind = p[at];
+        if (!kind) break;
+        if (kind == 1) { ++at; continue; }
+        if (at + 1 >= h || p[at + 1] < 2 || p[at + 1] > h - at) break;
+        if (kind == 2 && p[at + 1] == 4) e->mss = awdl_trace_u16(p + at + 2);
+        at += p[at + 1];
+      }
+    }
     e->size = (uint16_t)(plen - h);
     return true;
   }

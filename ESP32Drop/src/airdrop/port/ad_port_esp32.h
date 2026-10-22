@@ -13,6 +13,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include "../core/ad_status.h"
+#include "../core/ad_stream_error.h"
 #include "../core/ad_dnssd.h"   /* AIRDROP_PORT */
 #include "../core/ad_cpio.h"    /* AD_FILE_* and the archive walker */
 
@@ -58,7 +59,8 @@ void ad_preview_read(uint32_t transfer_id, uint32_t offset, uint8_t *dst,
  * The receive task decodes one record and waits for the consumer's ACK; it never
  * invokes application code. Poll on the application task; USB and SPI consumers
  * use the same DATA/COMMIT contract. Kind values also match host/protocol.py.
- * COMMIT may be acknowledged only after validating cpio and saving all originals.
+ * COMMIT may be acknowledged only after validating cpio and completing the
+ * consumer's output contract (durable files, or confirmed display completion).
  * Timeout/disconnect fails the upload before its HTTP success response. */
 enum { AD_STREAM_DATA = 8, AD_STREAM_COMMIT = 9, AD_STREAM_CHUNK_SIZE = 8192 };
 struct AdStreamPacket {
@@ -69,6 +71,8 @@ struct AdStreamPacket {
 bool ad_stream_enable(void);
 bool ad_stream_read(struct AdStreamPacket *out);
 void ad_stream_ack(uint32_t token, bool accepted, uint32_t files);
+/* Copies the reason; caller storage need not outlive this call. Late tokens are ignored. */
+void ad_stream_reject(uint32_t token, enum AdStreamError error, const char *message);
 /* Explicit diagnostic: 7 MiB synthetic archive through the real pump/consumer queues.
  * No radio transfer is measured. Refuses while an upload/delivery is pending. */
 bool ad_stream_self_test(void);

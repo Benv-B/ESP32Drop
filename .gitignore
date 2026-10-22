@@ -1,6 +1,7 @@
 # arduino-cli build output (regenerated; large, machine-specific paths)
 .build*/
 .build-lint*.log
+.build*.log
 
 # macOS / editors
 .DS_Store
@@ -20,3 +21,10 @@ __pycache__/
 received/
 backups/
 .ruff_cache/
+
+# Credentials and unrelated local research
+.env
+.env.*
+*.pem
+*.key
+/AI*.md
