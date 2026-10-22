@@ -57,7 +57,7 @@ powershell -ExecutionPolicy Bypass -File tools/test-iris.ps1
 powershell -ExecutionPolicy Bypass -File tools/test-bridge.ps1
 ```
 
-These checks cover software behavior and mocked hardware boundaries; they do not certify real-panel behavior or phone compatibility. CI also runs the shell host suites with sanitizers.
+These optional local checks cover software behavior and mocked hardware boundaries; they do not certify real-panel behavior or phone compatibility.
 
 ## Receive-only benchmark
 
